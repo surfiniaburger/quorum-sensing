@@ -58,11 +58,17 @@ bnb_server_params = StdioServerParameters(
     command="npx", args=["-y", "@openbnb/mcp-server-airbnb", "--ignore-robots-txt"]
 )
 
+mlb_stats_server_params = StdioServerParameters(
+    command="python", # Or "python3" if that's your interpreter
+    args=["./mcp_server/mlb_stats_server.py"], # Ensure path is correct
+)
+
 server_configs_instance = AllServerConfigs(
     configs={
         "weather": weather_server_params,
         "bnb": bnb_server_params,
         "ct": ct_server_params,
+        "mlb": mlb_stats_server_params,
     }
 )
 
@@ -74,6 +80,7 @@ ROOT_AGENT_INSTRUCTION = """
 * **Greetings:** If the user greets you, respond warmly and directly.
 * **Cocktails:** Route requests about cocktails, drinks, recipes, or ingredients to `cocktail_assistant`.
 * **Booking & Weather:** Route requests about booking accommodations (any type) or checking weather to `booking_assistant`.
+* **MLB Game Information:** If the request is about MLB scores, play-by-play, or game status, use the 'mlb' tools directly (e.g., `mlb_stats.get_live_game_score`, `mlb_stats.get_game_play_by_play_summary`). You will need a 'game_pk' (game ID) for these tools. If the user doesn't provide it, you might need to ask or infer it if possible (though for now, assume they provide it or you ask).
 * **Out-of-Scope:** If the request is unrelated (e.g., general knowledge, math), state directly that you cannot assist with that topic.
 **Key Directives:**
 * **Delegate Immediately:** Once a suitable sub-agent is identified, route the request without asking permission.
@@ -181,6 +188,7 @@ async def create_agent_with_preloaded_tools(
     combined_booking_tools = list(booking_tools)
     combined_booking_tools.extend(weather_tools)
     ct_tools = loaded_mcp_tools.get("ct", [])
+    mlb_tools = loaded_mcp_tools.get("mlb", [])
 
     booking_agent = LlmAgent(
         model=MODEL_ID,
@@ -205,11 +213,26 @@ async def create_agent_with_preloaded_tools(
         tools=ct_tools,
     )
 
+
+        # Option 2: Create a dedicated MLB sub-agent (Recommended for clarity if it grows)
+    mlb_assistant = LlmAgent(
+         model=MODEL_ID,
+         name="mlb_assistant", # ADK will make tools available as mlb_assistant.tool_name
+         instruction="""You are an MLB Stats assistant.
+         Use your tools to answer questions about MLB game scores, play-by-play, and other game details.
+         You have tools like `get_live_game_score` and `get_game_play_by_play_summary`.
+         Always require a 'game_pk' for these specific game data tools.
+         Format your response clearly.
+         If you don't know how to help, or none of your tools are appropriate for it,
+         call the function "agent_exit" hand over the task to other sub agent.""",
+         tools=mlb_tools, # Tools will be namespaced by the MCP server name, e.g., mlb_stats.get_live_game_score
+    )
+
     root_agent = LlmAgent(
         model=MODEL_ID,
         name="ai_assistant",
         instruction=ROOT_AGENT_INSTRUCTION,
-        sub_agents=[cocktail_agent, booking_agent],
+        sub_agents=[cocktail_agent, booking_agent, mlb_assistant],
     )
     return root_agent
 
