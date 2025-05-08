@@ -18,7 +18,7 @@
 // --- Configuration ---
 const MAX_RECONNECT_ATTEMPTS = 5;
 const RECONNECT_BASE_DELAY_MS = 5000; // 5 seconds
-const ROBOT_ICON_PATH = "robot1.png"; // Ensure this path is correct relative to HTML
+const ROBOT_ICON_PATH = "robot1.jpg"; // Ensure this path is correct relative to HTML
 const THINKING_INDICATOR_ID = "thinking-indicator-wrapper";
 
 // --- Module State ---

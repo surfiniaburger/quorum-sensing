@@ -1,7 +1,8 @@
 # mcp_server/mlb_stats_server.py
 import json
 import logging
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, List, Union
+from datetime import datetime, UTC, timedelta
 
 import httpx # Using httpx for async requests, similar to your weather_server
 from mcp.server.fastmcp import FastMCP
@@ -19,6 +20,65 @@ USER_AGENT = "mlb-stats-mcp-agent/1.0"
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+
+# --- Team ID Mapping ---
+TEAMS = {
+    'rangers': 140, 'texas rangers': 140,
+    'angels': 108, 'los angeles angels': 108, 'anaheim angels': 108,
+    'astros': 117, 'houston astros': 117,
+    'rays': 139, 'tampa bay rays': 139,
+    'blue jays': 141, 'toronto blue jays': 141,
+    'jays': 141,
+    'yankees': 147, 'new york yankees': 147,
+    'orioles': 110, 'baltimore orioles': 110,
+    'red sox': 111, 'boston red sox': 111,
+    'sox': 111, # Could be ambiguous with White Sox, but often refers to Red Sox in general context
+    'twins': 142, 'minnesota twins': 142,
+    'white sox': 145, 'chicago white sox': 145,
+    'guardians': 114, 'cleveland guardians': 114,
+    'tigers': 116, 'detroit tigers': 116,
+    'royals': 118, 'kansas city royals': 118,
+    'padres': 135, 'san diego padres': 135,
+    'giants': 137, 'san francisco giants': 137,
+    'diamondbacks': 109, 'arizona diamondbacks': 109, 'd-backs': 109,
+    'rockies': 115, 'colorado rockies': 115,
+    'phillies': 143, 'philadelphia phillies': 143,
+    'braves': 144, 'atlanta braves': 144,
+    'marlins': 146, 'miami marlins': 146,
+    'nationals': 120, 'washington nationals': 120, 'nats': 120,
+    'mets': 121, 'new york mets': 121,
+    'pirates': 134, 'pittsburgh pirates': 134,
+    'cardinals': 138, 'st. louis cardinals': 138, 'cards': 138,
+    'brewers': 158, 'milwaukee brewers': 158,
+    'cubs': 112, 'chicago cubs': 112,
+    'reds': 113, 'cincinnati reds': 113,
+    'athletics': 133, 'oakland athletics': 133, "a's": 133,
+    'mariners': 136, 'seattle mariners': 136,
+    'dodgers': 119, 'los angeles dodgers': 119,
+}
+
+CURRENT_YEAR = datetime.now(UTC).year
+
+# --- Helper Functions ---
+
+def internal_resolve_team_id(identifier: str) -> Optional[int]:
+    """
+    Tries to convert identifier to int if it's numeric, otherwise looks up in TEAMS.
+    This is an INTERNAL helper.
+    """
+    try:
+        # Check if the identifier string is purely numeric
+        if identifier.isdigit():
+            team_id_int = int(identifier)
+            # You might add a sanity check for typical ID ranges, e.g., 100-160
+            # For now, we assume if it's an int, it's an ID attempt.
+            return team_id_int
+    except ValueError:
+        # Not a string that directly converts to int, treat as name
+        pass
+    return TEAMS.get(identifier.lower().strip())
+
 
 # --- Helper Functions ---
 async def make_mlb_api_request(
@@ -152,7 +212,6 @@ async def get_game_play_by_play_summary(game_pk: int, count: int = 3) -> str:
         return f"Recent Plays for Game PK {game_pk} (most recent first):\n" + "\n".join(summaries)
     return f"Could not retrieve play-by-play data for game_pk {game_pk}."
 
-
 # Add this function inside mcp_server/mlb_stats_server.py
 
 def format_player_game_stats(player_data: Dict[str, Any], player_id: int) -> str:
@@ -280,7 +339,7 @@ async def get_player_stats_for_game(game_pk: int, player_id: int) -> str:
     except Exception as e:
         logger.error(f"Error processing player stats for game_pk {game_pk}, player_id {player_id}: {e}", exc_info=True)
         return f"Error processing player stats for player {player_id} in game {game_pk}."
-
+    
 
 # Add these imports at the top of mcp_server/mlb_stats_server.py
 from datetime import datetime, timedelta
@@ -309,35 +368,34 @@ def format_game_schedule_entry(game_info: Dict[str, Any]) -> str:
             f"  Status: {status}")
 
 @mcp.tool()
-async def get_team_schedule(team_id: int, days_range: int = 7) -> str:
+async def get_team_schedule(team_identifier: str, days_range: int = 7) -> str:
     """
-    Retrieves a team's game schedule for a specified range of days from today.
-    Positive days_range for future games, negative for past games.
+    Retrieves a team's game schedule.
+    Provide team name (e.g., "Dodgers") or team ID as a string (e.g., "119").
+    Days_range is for N days from today (e.g., 7 for next 7 days, -3 for last 3 days).
 
     Args:
-        team_id: The MLB official ID for the team.
-        days_range: Number of days from today. Default is 7 (next 7 days).
-                    Use negative for past days (e.g., -3 for last 3 days).
+        team_identifier: Team name or ID (as a string).
+        days_range: Number of days from today. Default 7.
     """
-    if not isinstance(team_id, int):
-        try: team_id = int(team_id)
-        except ValueError: return "Invalid team_id. Must be an integer."
-    if not isinstance(days_range, int):
-        try: days_range = int(days_range)
-        except ValueError: days_range = 7 # default
+    team_id = internal_resolve_team_id(team_identifier)
+    if team_id is None:
+        return f"Team '{team_identifier}' not recognized. Please use a known team name or a numeric team ID."
 
-    logger.info(f"MCP Tool: get_team_schedule called for team_id={team_id}, days_range={days_range}")
+    # days_range will be an int due to tool signature, or its default
+    actual_days_range = days_range
 
-    today = datetime.utcnow().date() # Use UTC for consistency with API if possible
-    if days_range >= 0:
+    logger.info(f"MCP Tool: get_team_schedule for team_id={team_id} (from '{team_identifier}'), days_range={actual_days_range}")
+
+    today = datetime.utcnow().date()
+    if actual_days_range >= 0:
         start_date = today
-        end_date = today + timedelta(days=days_range)
-        period_desc = f"next {days_range+1} days" if days_range > 0 else "today"
-    else: # days_range is negative
-        start_date = today + timedelta(days=days_range) # days_range is negative, so this goes back
+        end_date = today + timedelta(days=actual_days_range)
+        period_desc = f"next {actual_days_range+1} days" if actual_days_range > 0 else "today"
+    else:
+        start_date = today + timedelta(days=actual_days_range)
         end_date = today
-        period_desc = f"last {-days_range} days including today"
-
+        period_desc = f"last {-actual_days_range} days including today"
 
     start_date_str = start_date.strftime("%Y-%m-%d")
     end_date_str = end_date.strftime("%Y-%m-%d")
@@ -345,35 +403,23 @@ async def get_team_schedule(team_id: int, days_range: int = 7) -> str:
     schedule_data = await make_mlb_api_request(
         endpoint_version="v1",
         path="schedule",
-        params={
-            "sportId": 1,
-            "teamId": team_id,
-            "startDate": start_date_str,
-            "endDate": end_date_str,
-            # "fields": "dates,date,games,gamePk,officialDate,status,detailedState,teams,away,home,team,name,score,venue,name" # Optional: limit fields
-        }
+        params={"sportId": 1, "teamId": team_id, "startDate": start_date_str, "endDate": end_date_str}
     )
 
     if not schedule_data or not schedule_data.get("dates"):
-        return f"No schedule found for team ID {team_id} for {period_desc} ({start_date_str} to {end_date_str})."
+        return f"No schedule found for {team_identifier} (ID: {team_id}) for {period_desc} ({start_date_str} to {end_date_str})."
 
+    # ... (formatting logic from previous version)
     all_games_formatted = []
     for date_entry in schedule_data.get("dates", []):
         games_on_date = date_entry.get("games", [])
         for game in games_on_date:
             all_games_formatted.append(format_game_schedule_entry(game))
-
     if not all_games_formatted:
-        return f"No games scheduled for team ID {team_id} within {period_desc} ({start_date_str} to {end_date_str})."
+        return f"No games scheduled for {team_identifier} (ID: {team_id}) within {period_desc} ({start_date_str} to {end_date_str})."
+    team_name_display = team_identifier.title()
+    return f"Schedule for {team_name_display} ({period_desc}):\n" + "\n---\n".join(all_games_formatted)
 
-    # Fetch team name for better output
-    team_name = f"Team ID {team_id}"
-    team_info_data = await make_mlb_api_request(endpoint_version="v1", path=f"teams/{team_id}")
-    if team_info_data and team_info_data.get("teams"):
-        team_name = team_info_data["teams"][0].get("name", team_name)
-
-
-    return f"Schedule for {team_name} ({period_desc}):\n" + "\n---\n".join(all_games_formatted)
 
 
 # Add this function inside mcp_server/mlb_stats_server.py
@@ -397,13 +443,14 @@ def format_standings_record(team_record: Dict[str, Any], division_name: str) -> 
 
 
 @mcp.tool()
-async def get_league_standings(league_id: int, season: Optional[int] = None) -> str:
+async def get_league_standings(league_id: int, season: int) -> str:
     """
     Retrieves the current standings for a given MLB league (AL or NL).
+    Provide the season year. If you are unsure of the current season, you can try providing the current calendar year.
 
     Args:
         league_id: The ID for the league (103 for American League, 104 for National League).
-        season: The season year (e.g., 2024). Defaults to the current MLB season if not provided.
+        season: The season year (e.g., 2024).
     """
     if league_id not in [103, 104]:
         return "Invalid league_id. Use 103 for American League or 104 for National League."
@@ -417,7 +464,7 @@ async def get_league_standings(league_id: int, season: Optional[int] = None) -> 
             # or just the absolute latest.
             # A more robust way is to get seasonId from /api/v1/schedule/games for today's date.
             # For now, let's just use the current year if API fails.
-            current_year = datetime.utcnow().year
+            current_year = datetime.now(UTC)
             latest_api_season = current_year
             for s_entry in reversed(season_data["seasons"]): # Check latest first
                 if s_entry.get("seasonStartDate") and s_entry.get("regularSeasonEndDate"):
@@ -428,7 +475,7 @@ async def get_league_standings(league_id: int, season: Optional[int] = None) -> 
                     break
             season = latest_api_season
         else:
-            season = datetime.utcnow().year # Fallback to current calendar year
+            season = datetime.now(UTC) # Fallback to current calendar year
         logger.info(f"MCP Tool: get_league_standings - season not provided, using: {season}")
 
 
@@ -485,6 +532,87 @@ async def get_league_standings(league_id: int, season: Optional[int] = None) -> 
     return "\n".join(output_lines)
 
 
+def format_team_roster(
+    roster_entries: List[Dict[str, Any]],
+    team_name: str,
+    team_id: int,
+    season: int,
+    roster_type: str
+) -> str:
+    """Formats team roster data into a readable string."""
+    if not roster_entries:
+        return f"No roster information found for {team_name} (ID: {team_id}) for the {season} season" \
+               f"{f' (Type: {roster_type})' if roster_type else ''}."
+
+    type_display = f" ({roster_type} Roster)" if roster_type else " Roster"
+    summary_lines = [f"{team_name}{type_display} - {season} Season (Team ID: {team_id}):"]
+
+    for player_entry in roster_entries:
+        person = player_entry.get("person", {})
+        player_name = person.get("fullName", "N/A")
+        player_id = person.get("id", "N/A")
+        jersey_number = player_entry.get("jerseyNumber", "--")
+        position = player_entry.get("position", {}).get("abbreviation", "N/A")
+        status = player_entry.get("status", {}).get("description", "N/A") # e.g., "Active", "Injured List"
+
+        summary_lines.append(
+            f"  - #{jersey_number:<3} {player_name:<25} (ID: {player_id}) | Pos: {position:<5} | Status: {status}"
+        )
+
+    return "\n".join(summary_lines)
+
+
+@mcp.tool()
+async def get_team_roster(team_identifier: str, season: int = 0, roster_type: str = "") -> str:
+    """
+    Retrieves a team's roster.
+    Provide team name (e.g., "Dodgers") or team ID as a string (e.g., "119").
+    Season is year (e.g., 2024); 0 or empty means current year.
+    Roster type (e.g., "40Man", "active"); empty means default.
+
+    Args:
+        team_identifier: Team name or ID (as a string).
+        season: Season year. Default 0 (uses current year).
+        roster_type: Roster type. Default "" (uses API default).
+    """
+    team_id = internal_resolve_team_id(team_identifier)
+    if team_id is None:
+        return f"Team '{team_identifier}' not recognized. Please use a known team name or a numeric team ID."
+
+    actual_season = season
+    if not actual_season or actual_season == 0: # Check for 0 or potentially other sentinel if needed
+        actual_season = CURRENT_YEAR
+        logger.info(f"MCP Tool: get_team_roster - season not provided or 0, defaulting to {actual_season}")
+
+    actual_roster_type = roster_type.strip()
+
+    logger.info(f"MCP Tool: get_team_roster for team_id={team_id} (from '{team_identifier}'), season={actual_season}, roster_type='{actual_roster_type}'")
+
+    params: Dict[str, Any] = {"season": actual_season}
+    if actual_roster_type: # Only add if it's not an empty string
+        params["rosterType"] = actual_roster_type
+
+    roster_data_response = await make_mlb_api_request(
+        endpoint_version="v1",
+        path=f"teams/{team_id}/roster",
+        params=params
+    )
+
+    official_team_name = team_identifier.title()
+    team_info_data = await make_mlb_api_request(endpoint_version="v1", path=f"teams/{team_id}")
+    if team_info_data and team_info_data.get("teams"):
+        official_team_name = team_info_data["teams"][0].get("name", official_team_name)
+
+    if not roster_data_response or "roster" not in roster_data_response:
+        error_msg = f"Could not retrieve roster for {official_team_name} (ID: {team_id}) for season {actual_season}"
+        if actual_roster_type: error_msg += f" (type: {actual_roster_type})"
+        return error_msg + "."
+
+    return format_team_roster(
+        roster_data_response["roster"], official_team_name, team_id, actual_season, actual_roster_type if actual_roster_type else None
+    )
+
+# ... (rest of your mlb_stats_server.py, including if __name__ == "__main__":)
 # You can add more tools here:
 # - get_player_stats_for_game(game_pk: int, player_id: int)
 # - get_team_schedule(team_id: int, days_ahead: int = 7)
