@@ -20,6 +20,7 @@ from google.adk.tools.mcp_tool.mcp_toolset import MCPToolset, StdioServerParamet
 from google.genai import types
 from pydantic import BaseModel
 from starlette.websockets import WebSocketDisconnect
+from voice_agent import router as voice_agent_router 
 
 # --- Configuration & Global Setup ---
 load_dotenv()
@@ -32,6 +33,9 @@ STATIC_DIR = "static"
 session_service = InMemorySessionService()
 artifacts_service = InMemoryArtifactService()
 
+# Global variable to hold loaded MCP tools after lifespan startup
+# This will be accessed by the function called from voice_agent.py
+loaded_mcp_tools_global: Dict[str, Any] = {}
 
 class AllServerConfigs(BaseModel):
     """
@@ -292,6 +296,70 @@ async def _run_agent_and_get_response(
     return response_parts
 
 
+async def process_voice_query_with_adk(session_id: str, user_query: str) -> str:
+    """
+    Processes a text query (transcribed from voice) using the main ADK agent system.
+    This function is designed to be called from the voice_agent module.
+    Args:
+        session_id: The unique session identifier.
+        user_query: The transcribed text from the user's voice input.
+    Returns:
+        A string containing the ADK agent's response or an error message.
+    """
+    logging.info(f"ADK processing voice query for session {session_id}: '{user_query}'")
+
+    if not loaded_mcp_tools_global:
+        logging.error("ADK tools not loaded globally. Cannot process voice query.")
+        return "I'm sorry, my core tools are not available right now. Please try again later."
+
+    if not session_service or not artifacts_service:
+        logging.error("ADK session or artifact service not initialized.")
+        return "I'm sorry, there's an issue with my internal services. Please try again later."
+
+    try:
+        # Ensure ADK session exists (create if not)
+        # The ADK session service manages its own state.
+        try:
+            session_service.get_session(session_id=session_id)
+            logging.debug(f"ADK session {session_id} already exists.")
+        except KeyError: # Assuming KeyError if session not found by InMemorySessionService
+            logging.info(f"Creating new ADK session {session_id} for voice query.")
+            session_service.create_session(
+                app_name=APP_NAME, user_id=session_id, session_id=session_id, state={}
+            )
+
+        # Prepare content for the ADK agent
+        content_for_adk = types.Content(role="user", parts=[types.Part(text=user_query)])
+
+        # Create the root agent (it's lightweight to create)
+        root_adk_agent = await create_agent_with_preloaded_tools(loaded_mcp_tools_global)
+
+        # Initialize and run the ADK Runner
+        adk_runner = Runner(
+            app_name=APP_NAME,
+            agent=root_adk_agent,
+            artifact_service=artifacts_service,
+            session_service=session_service,
+        )
+
+        response_parts = await _run_agent_and_get_response(
+            adk_runner, session_id, content_for_adk
+        )
+
+        if response_parts:
+            final_response = " ".join(response_parts)
+            logging.info(f"ADK response for voice query (session {session_id}): {final_response}")
+            return final_response
+        else:
+            logging.warning(f"ADK agent provided no response parts for voice query (session {session_id}).")
+            return "I don't have a specific response for that right now."
+
+    except Exception as e:
+        logging.error(f"Error during ADK processing for voice query (session {session_id}): {e}", exc_info=True)
+        return "I encountered an unexpected problem while processing your request. Please try again."
+
+
+
 async def _get_runner_async(
     loaded_mcp_tools: Dict[str, Any], session_id: str, query: str
 ) -> List[str]:
@@ -337,12 +405,13 @@ async def _get_runner_async(
 
 
 @asynccontextmanager
-async def app_lifespan(app_instance: FastAPI) -> Any:
+async def app_lifespan(app_instance: FastAPI) -> Any: 
     """
     Manages application startup and shutdown operations for the FastAPI app.
     Args:
         app_instance: The FastAPI application instance.
     """
+    global loaded_mcp_tools_global # To store tools for the voice agent call
     logging.info("Application Lifespan: Startup initiated.")
     app_instance.state.mcp_tools = {}
     app_instance.state.mcp_tool_exit_stack = None
@@ -352,6 +421,7 @@ async def app_lifespan(app_instance: FastAPI) -> Any:
             server_configs_instance
         )
         app_instance.state.mcp_tools = collected_tools
+        loaded_mcp_tools_global = collected_tools     # For voice agent function
         app_instance.state.mcp_tool_exit_stack = tool_stack
         logging.info(
             "Application Lifespan: MCP Toolset initialized. Tools: %s",
@@ -382,6 +452,8 @@ async def app_lifespan(app_instance: FastAPI) -> Any:
 # Instantiate FastAPI with the lifespan manager
 app = FastAPI(lifespan=app_lifespan)
 
+# Include the Voice Agent Router
+app.include_router(voice_agent_router) # The paths from voice_agent.py will be registered
 
 # --- WebSocket Communication ---
 async def run_adk_agent_async(
@@ -422,7 +494,7 @@ async def run_adk_agent_async(
     finally:
         logging.info("Agent WebSocket task ending for session %s.", session_id)
 
-
+ 
 @app.websocket("/ws/{session_id}")
 async def websocket_endpoint(websocket: WebSocket, session_id: str) -> None:
     """
