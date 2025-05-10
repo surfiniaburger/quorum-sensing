@@ -10,5 +10,6 @@ dependencies = [
     "google-adk>=0.1.0",
     "google-cloud>=0.34.0",
     "mcp>=1.6.0",
+    "google-generativeai>=0.8.5",
     "uvicorn>=0.34.1",
 ]

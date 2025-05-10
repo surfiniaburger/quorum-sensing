@@ -6,9 +6,8 @@ import asyncio
 import contextlib
 from contextlib import asynccontextmanager
 import json
-import logging
 from typing import Any, Dict, List, Optional, Tuple
-
+from fastapi import HTTPException
 from dotenv import load_dotenv
 from fastapi import FastAPI, WebSocket
 from fastapi.staticfiles import StaticFiles
@@ -21,6 +20,13 @@ from google.genai import types
 from pydantic import BaseModel
 from starlette.websockets import WebSocketDisconnect
 from voice_agent import router as voice_agent_router 
+import logging
+logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(name)s - %(message)s')
+
+from google.adk.runners import Runner
+import inspect
+print("Runner class signature:")
+print(inspect.signature(Runner.__init__))
 
 # --- Configuration & Global Setup ---
 load_dotenv()
@@ -296,69 +302,129 @@ async def _run_agent_and_get_response(
     return response_parts
 
 
+# NEW Helper specifically for the voice query path, ensuring user_id is passed
+async def _run_voice_agent_and_get_response(
+    runner: Runner,
+    session_id: str,
+    user_id: str, # Explicitly take user_id
+    content: types.Content,
+) -> List[str]:
+    logging.info(f"VOICE AGENT HELPER: Running agent for app '{runner.app_name}', session '{session_id}', user '{user_id}'.")
+    events_async = runner.run_async(
+        session_id=session_id,
+        user_id=user_id,     # Pass user_id explicitly
+        new_message=content
+        # app_name is known by the runner instance
+    )
+    response_parts: List[str] = []
+    async for event in events_async:
+        try:
+            if hasattr(event, "content") and event.content.role == "model":
+                if hasattr(event.content, "parts") and event.content.parts:
+                    if event.content.parts[0] and hasattr(event.content.parts[0], "text"):
+                        part_text = getattr(event.content.parts[0], "text", None)
+                        if isinstance(part_text, str) and part_text:
+                            response_parts.append(part_text)
+        except AttributeError as e:
+            logging.warning("Could not process event attribute during voice agent helper run: %s. Event: %s", e, event)
+    logging.info(f"VOICE AGENT HELPER: Agent run finished. Response parts: {response_parts}")
+    return response_parts
+
+
+# main.py
+# ... (imports)
+
+# --- Global variable for monkey-patching ---
+original_get_session = None # Defined globally
+
+# ... (APP_NAME, session_service, loaded_mcp_tools_global, etc.) ...
+
 async def process_voice_query_with_adk(session_id: str, user_query: str) -> str:
-    """
-    Processes a text query (transcribed from voice) using the main ADK agent system.
-    This function is designed to be called from the voice_agent module.
-    Args:
-        session_id: The unique session identifier.
-        user_query: The transcribed text from the user's voice input.
-    Returns:
-        A string containing the ADK agent's response or an error message.
-    """
+    global original_get_session # <<< --- ADD THIS LINE ---
+    
     logging.info(f"ADK processing voice query for session {session_id}: '{user_query}'")
+    user_id_for_adk = session_id
+    session_key_tuple = (APP_NAME, user_id_for_adk, session_id)
 
-    if not loaded_mcp_tools_global:
-        logging.error("ADK tools not loaded globally. Cannot process voice query.")
-        return "I'm sorry, my core tools are not available right now. Please try again later."
-
-    if not session_service or not artifacts_service:
-        logging.error("ADK session or artifact service not initialized.")
-        return "I'm sorry, there's an issue with my internal services. Please try again later."
+    if not loaded_mcp_tools_global: return "Core tools not available."
+    if not session_service: return "Session service not available."
 
     try:
-        # Ensure ADK session exists (create if not)
-        # The ADK session service manages its own state.
+        # 1. Ensure ADK session exists (create if not)
+        current_session_obj = None
+        retrieved_session_from_get = None
+
+        logging.info(f"VOICE_ADK: Attempting to GET session with key components: app='{APP_NAME}', user='{user_id_for_adk}', session='{session_id}'")
         try:
-            session_service.get_session(session_id=session_id)
-            logging.debug(f"ADK session {session_id} already exists.")
-        except KeyError: # Assuming KeyError if session not found by InMemorySessionService
-            logging.info(f"Creating new ADK session {session_id} for voice query.")
-            session_service.create_session(
-                app_name=APP_NAME, user_id=session_id, session_id=session_id, state={}
+            retrieved_session_from_get = session_service.get_session(
+                app_name=APP_NAME, user_id=user_id_for_adk, session_id=session_id
             )
+        except KeyError:
+            logging.info(f"VOICE_ADK: get_session raised KeyError for {session_key_tuple}. Session does not exist yet.")
+            # retrieved_session_from_get remains None
 
-        # Prepare content for the ADK agent
+        if retrieved_session_from_get is not None:
+            current_session_obj = retrieved_session_from_get
+            logging.info(f"VOICE_ADK: Session GET successful. Session ID: {current_session_obj.id}, State: {current_session_obj.state}")
+        else:
+            logging.info(f"VOICE_ADK: Session not found/None via GET. Attempting to CREATE session with key: {session_key_tuple}")
+            current_session_obj = session_service.create_session(
+                app_name=APP_NAME, user_id=user_id_for_adk, session_id=session_id, state={"source": "voice_adk_create_after_get_fail"}
+            )
+            logging.info(f"VOICE_ADK: Session CREATED successfully. Session ID: {current_session_obj.id}, State: {current_session_obj.state}")
+        
+        if hasattr(session_service, '_sessions') and isinstance(session_service._sessions, dict):
+            logging.info(f"VOICE_ADK: Keys in session_service._sessions before Runner: {list(session_service._sessions.keys())}")
+            if session_key_tuple in session_service._sessions:
+                actual_obj_in_dict = session_service._sessions[session_key_tuple]
+                obj_id = actual_obj_in_dict.id if actual_obj_in_dict else 'None Object in Dict'
+                logging.info(f"VOICE_ADK: CONFIRMED key {session_key_tuple} IS in _sessions. Object type: {type(actual_obj_in_dict)}, ID: {obj_id}")
+            else:
+                logging.warning(f"VOICE_ADK: WARNING - key {session_key_tuple} IS NOT in _sessions dict before Runner.")
+        
         content_for_adk = types.Content(role="user", parts=[types.Part(text=user_query)])
-
-        # Create the root agent (it's lightweight to create)
         root_adk_agent = await create_agent_with_preloaded_tools(loaded_mcp_tools_global)
 
-        # Initialize and run the ADK Runner
+        logging.info(f"VOICE_ADK: Initializing Runner with app_name='{APP_NAME}', agent_type={type(root_adk_agent)}, artifact_service_type={type(artifacts_service)}, session_service_type={type(session_service)}")
+        
+        # --- RUNNER INITIALIZATION ---
         adk_runner = Runner(
             app_name=APP_NAME,
             agent=root_adk_agent,
             artifact_service=artifacts_service,
-            session_service=session_service,
+            session_service=session_service
+            # memory_service is optional in your Runner's signature, so omitting it is fine
         )
-
-        response_parts = await _run_agent_and_get_response(
-            adk_runner, session_id, content_for_adk
+        logging.info(f"VOICE_ADK: Runner initialized successfully. Instance ID: {id(adk_runner)}")
+        # --- END OF CORRECTION ---
+        
+        logging.info(f"VOICE_ADK: Calling _run_voice_agent_and_get_response with session_id='{session_id}', user_id='{user_id_for_adk}'")
+        response_parts = await _run_voice_agent_and_get_response(
+            adk_runner, session_id, user_id_for_adk, content_for_adk
         )
+        # The restoration of original_get_session will happen in the finally block
 
         if response_parts:
             final_response = " ".join(response_parts)
-            logging.info(f"ADK response for voice query (session {session_id}): {final_response}")
             return final_response
         else:
-            logging.warning(f"ADK agent provided no response parts for voice query (session {session_id}).")
-            return "I don't have a specific response for that right now."
+            return "ADK processed (voice) but no text parts."
 
+    # ... (except ValueError, except Exception as before) ...
+    except ValueError as ve:
+        # ...
+        logging.error(f"VOICE_ADK: ValueError: {ve}", exc_info=True)
+        return "I'm having trouble with conversation data (Runner)." if "Session not found" in str(ve) else "Data problem (voice)."
     except Exception as e:
-        logging.error(f"Error during ADK processing for voice query (session {session_id}): {e}", exc_info=True)
-        return "I encountered an unexpected problem while processing your request. Please try again."
-
-
+        logging.error(f"VOICE_ADK: General error: {e}", exc_info=True)
+        return "Unexpected problem (voice)."
+    finally:
+        # Ensure restoration of the original get_session method
+        # Check if it was patched in THIS call by checking if original_get_session (the global) has a value
+        if original_get_session is not None and hasattr(session_service, 'get_session') and session_service.get_session.__name__ == 'patched_get_session':
+            session_service.get_session = original_get_session
+            logging.info("VOICE_ADK: Restored original session_service.get_session in finally block.")
+            original_get_session = None # Reset global for the next potential call to process_voice_query_with_adk
 
 async def _get_runner_async(
     loaded_mcp_tools: Dict[str, Any], session_id: str, query: str
@@ -391,12 +457,19 @@ async def _get_runner_async(
         return ["Error: Essential tools not loaded, cannot process request."]
 
     root_agent = await create_agent_with_preloaded_tools(loaded_mcp_tools)
+    logging.info(f"TEXT_PATH: About to create Runner. Using session_service instance ID: {id(session_service)}")
+    logging.info(f"TEXT_PATH: Session service type: {type(session_service)}")
+    if hasattr(session_service, '_sessions'):
+        logging.info(f"TEXT_PATH: Keys in session_service._sessions before Runner: {list(session_service._sessions.keys())}")
+    else:
+        logging.info("TEXT_PATH: session_service does not have _sessions attribute.")
     runner = Runner(
         app_name=APP_NAME,
         agent=root_agent,
         artifact_service=artifacts_service,
         session_service=session_service,
     )
+    logging.info(f"TEXT_PATH: Runner created. Runner's session_service instance ID: {id(runner.session_service)}")
     response = await _run_agent_and_get_response(runner, session_id, content)
     return response
 
@@ -431,6 +504,8 @@ async def app_lifespan(app_instance: FastAPI) -> Any:
         logging.error("Command or script not found for key: %s", file_error)
     except ConnectionRefusedError as conn_refused:
         logging.error("Connection refused for key: %s", conn_refused)
+    except Exception as e: # Catch a broader range of exceptions during startup
+        logging.error(f"Critical error during MCP Toolset initialization: {e}", exc_info=True)
     yield
 
     logging.info("Application Lifespan: Shutdown initiated.")
@@ -542,6 +617,31 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str) -> None:
         )
     finally:
         logging.info("WebSocket endpoint cleanup for session %s.", session_id)
+
+
+# --- TEMPORARY TEST ROUTE (Remove or comment out for production) ---
+class TestADKQuery(BaseModel):
+    session_id: str
+    query: str
+
+@app.post("/test_adk_voice_logic")
+async def test_adk_processing(payload: TestADKQuery):
+    """
+    Temporary HTTP endpoint to directly test process_voice_query_with_adk.
+    """
+    logging.info(f"Received test request for /test_adk_voice_logic with payload: {payload}")
+    if not loaded_mcp_tools_global: # Check if lifespan has run and tools are loaded
+         raise HTTPException(status_code=503, detail="ADK Tools not loaded yet. Wait for app startup.")
+    try:
+        response_text = await process_voice_query_with_adk(
+            session_id=payload.session_id,
+            user_query=payload.query
+        )
+        return {"session_id": payload.session_id, "query": payload.query, "adk_response": response_text}
+    except Exception as e:
+        logging.error(f"Error in /test_adk_voice_logic: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+# --- END OF TEMPORARY TEST ROUTE ---
 
 
 # Mount static files (e.g., for a web UI)
