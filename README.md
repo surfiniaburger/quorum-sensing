@@ -152,3 +152,16 @@ gcloud run deploy $SERVICE_NAME \
 ```
 
 On successful deployment, you will be provided a URL to the Cloud Run service. You can visit that in the browser to view the Cloud Run application that you just deployed.
+
+
+## Achieved
+
+Audio -> Live API STT -> Tool Call -> Your ADK -> LLM -> ADK Response -> Live API TTS -> Audio
+
+## UPNEXT
+
+simple ui
+
+## GOAL
+
+A voice-controlled video generator 
