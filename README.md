@@ -137,7 +137,7 @@ export SERVICE_NAME='adk-multiagent-mcp-app'
 export LOCATION='us-central1'
 
 # Replace with your Google Cloud Project ID
-export PROJECT_ID='your-project-id'
+export PROJECT_ID='silver-455021'
 ```
 
 In Cloud Shell, execute the following command:

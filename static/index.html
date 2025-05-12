@@ -1,16 +1,18 @@
 <!doctype html>
 <html>
   <head>
-    <title>ADK MCP App</title>
+    <title>ADK Multi-Agent Voice Assistant</title> <!-- Updated Title -->
     <meta name="color-scheme" content="light dark" />
     <link rel="stylesheet" href="styles.css" />
     <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <!-- Simple Mic Icon (SVG) - you can replace with a better one or an icon font -->
+    <link rel="stylesheet" href="https://fonts.googleapis.com/icon?family=Material+Icons+Outlined">
   </head>
 
-  <body>
+  <body class="dark-theme"> <!-- Apply dark theme by default -->
     <div class="tab-nav">
       <button class="tab-button active" data-tab="app-tab-content">
-        Chatbot
+        ADK Assistant
       </button>
       <button class="tab-button" data-tab="user-guide-tab-content">
         User Guide
@@ -26,23 +28,32 @@
               alt="ADK Logo"
               class="logo"
               title="Agent Development Kit" />
-            <h1>ADK Multi-Agent Integrated with MCP</h1>
+            <h1>ADK Multi-Agent Voice Assistant</h1> <!-- Updated H1 -->
           </div>
-          <div id="messages"></div>
+          <div id="messages">
+            <!-- Chat messages will appear here -->
+          </div>
           <form id="message-form">
             <input
               type="text"
               id="message"
               name="message"
-              placeholder="Type your message..."
+              placeholder="Type your message or use the mic..."
               autocomplete="off" />
-            <button type="submit" id="send-button" disabled>Send</button>
+            <button type="submit" id="send-button" class="icon-button" disabled>
+                <span class="material-icons-outlined">send</span>
+            </button>
+            <button type="button" id="mic-button" class="icon-button"> <!-- Changed to type="button" -->
+                <span class="material-icons-outlined" id="mic-icon">mic</span>
+            </button>
           </form>
         </div>
       </div>
 
       <div id="user-guide-tab-content" class="tab-panel">
-        <div id="user-guide-markdown-content"></div>
+        <div id="user-guide-markdown-content">
+          <!-- User guide will be loaded here -->
+        </div>
       </div>
     </div>
 
