@@ -126,7 +126,12 @@ async def websocket_voice_endpoint(websocket: WebSocket, session_id: str):
                 text="You are a voice assistant. When a user speaks, transcribe their query. Then, use the 'invoke_adk_agent_system' tool to get a detailed answer from the main assistant using the transcribed query. Finally, present that answer back to the user naturally in voice. If the main assistant provides an error, relay that information calmly."
             )])
         )
-        logging.info(f"Voice client '{session_id}': Constructed LiveConnectConfig: {live_api_config.to_dict() if hasattr(live_api_config, 'to_dict') else 'Cannot print config dict'}")
+        try:
+            logging.info(f"Voice client '{session_id}': Constructed LiveConnectConfig: {live_api_config.model_dump_json(indent=2)}")
+        except AttributeError:
+            logging.info(f"Voice client '{session_id}': Constructed LiveConnectConfig (fields): {vars(live_api_config)}")
+        except Exception as e_conf:
+            logging.warning(f"Voice client '{session_id}': Could not serialize LiveConnectConfig for logging: {e_conf}")
 
         logging.info(f"Voice client '{session_id}': Attempting genai_client.aio.live.connect...")
         async with genai_client.aio.live.connect(
@@ -165,18 +170,48 @@ async def websocket_voice_endpoint(websocket: WebSocket, session_id: str):
                 mime_type="audio/pcm;rate=16000"
             ):
                 if not is_live_session_active: break
+                
+                logging.info(f"SERVER_LOOP: Received server_message from Live API. Keys: {list(server_message._pb.DESCRIPTOR.fields_by_name.keys()) if hasattr(server_message, '_pb') and hasattr(server_message._pb, 'DESCRIPTOR') else 'N/A'}")
+                logging.info(f"  Has server_content: {server_message.server_content is not None}")
+                logging.info(f"  Has tool_call: {server_message.tool_call is not None}")
+                logging.info(f"  Has go_away: {server_message.go_away is not None}")
+                if hasattr(server_message, 'usage_metadata') and server_message.usage_metadata: logging.info(f"  UsageMetadata: {server_message.usage_metadata}")
+                if hasattr(server_message, 'debug_info') and server_message.debug_info: logging.info(f"  DebugInfo: {server_message.debug_info}")
+
 
                 if server_message.server_content:
+                    logging.info(f"SERVER_LOOP: Processing server_content. Type: {type(server_message.server_content)}")
                     model_turn = server_message.server_content.model_turn
-                    if model_turn and model_turn.parts:
-                        for part in model_turn.parts:
-                            if part.inline_data and part.inline_data.mime_type == f"audio/pcm;rate=24000":
+                    if model_turn:
+                        logging.info(f"SERVER_LOOP: Processing model_turn. Has parts: {model_turn.parts is not None}")
+                        if model_turn.parts:
+                            logging.info(f"SERVER_LOOP: Number of parts in model_turn: {len(model_turn.parts)}")
+                            for i, part in enumerate(model_turn.parts):
+                                # --- VERY DETAILED PART INSPECTION ---
+                                logging.info(f"SERVER_LOOP: Inspecting Part[{i}]:")
+                                logging.info(f"  Part[{i}] - Has inline_data: {part.inline_data is not None}")
+                                if part.inline_data and \
+                                   (part.inline_data.mime_type == 'audio/pcm' or part.inline_data.mime_type == 'audio/pcm;rate=24000') and \
+                                   part.inline_data.data:
+                                    if websocket.client_state == WebSocketState.CONNECTED:
+                                        logging.info(f"SERVER: Attempting to send {len(part.inline_data.data)} audio bytes (mime: '{part.inline_data.mime_type}') to client '{session_id}'")
+                                        await websocket.send_bytes(part.inline_data.data)
+                                        logging.info(f"SERVER: Successfully sent {len(part.inline_data.data)} audio bytes to client '{session_id}'")
+                                if part.text:
+                                    logging.info(f"    Part[{i}] text content: '{part.text}'")
+                                # Log all attributes of the part object for good measure
+                                logging.info(f"  Part[{i}] - All attributes: {vars(part) if hasattr(part, '__dict__') else 'Cannot get vars'}")
+                                # --- END DETAILED PART INSPECTION --
+                            if part.inline_data and part.inline_data.mime_type == f"audio/pcm;rate=24000" and part.inline_data.data:
                                 if websocket.client_state == WebSocketState.CONNECTED:
+                                    logging.info(f"SERVER: Sending {len(part.inline_data.data)} audio bytes to client '{session_id}'")
                                     await websocket.send_bytes(part.inline_data.data)
+                                    logging.info(f"SERVER: Successfully sent {len(part.inline_data.data)} audio bytes to client '{session_id}'")
                             elif part.text:
                                  if websocket.client_state == WebSocketState.CONNECTED:
                                     logging.info(f"Voice client '{session_id}': Live API Gemini audio transcript: '{part.text}'")
                                     await websocket.send_text(json.dumps({"type": "gemini_transcript", "text": part.text}))
+                                   
                 
                 elif server_message.tool_call:
                     logging.info(f"Voice client '{session_id}': Live API requesting tool_call: {server_message.tool_call.function_calls}")

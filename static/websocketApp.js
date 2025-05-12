@@ -1,406 +1,540 @@
-/**
- * Copyright 2025 Google LLC
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- * http://www.apache.org/licenses/LICENSE-2.0
- **/
+// static/websocketApp.js
 
-/* global marked */ // Inform linting tools that 'marked' is a global variable
-
-/**
- * @module websocketApp
- * Handles the core WebSocket chat application logic, including connection,
- * message sending/receiving, UI updates, and reconnection attempts.
- */
+/* global marked */
 
 // --- Configuration ---
 const MAX_RECONNECT_ATTEMPTS = 5;
-const RECONNECT_BASE_DELAY_MS = 5000; // 5 seconds
-const ROBOT_ICON_PATH = "robot1.jpg"; // Ensure this path is correct relative to HTML
+const RECONNECT_BASE_DELAY_MS = 5000;
+const ROBOT_ICON_PATH = "robot1.jpg";
 const THINKING_INDICATOR_ID = "thinking-indicator-wrapper";
+const VOICE_WEBSOCKET_ENDPOINT = "/ws/voice/";
+const TARGET_SAMPLE_RATE = 16000;
 
 // --- Module State ---
-let ws = null; // WebSocket instance
+let textWs = null;
+let voiceWs = null;
 let reconnectAttempts = 0;
-let messageForm, messageInput, messagesDiv, sendButton; // DOM elements
-let appInitialized = false; // Flag to prevent multiple initializations
+let messageForm, messageInput, messagesDiv, sendButton, micButton, micIcon;
+let appInitialized = false;
+
+let audioContext;
+let mediaStream;
+let audioProcessorNode;
+let isListening = false;
+
+// --- NEW: Audio Playback Queue and State ---
+let browserAudioPlaybackQueue = []; // Array to hold ArrayBuffer chunks
+let isPlayingAudio = false;       // Flag to indicate if playback is active
+let expectedPlaybackSampleRate = 24000; // Audio from Gemini is 24kHz
+let isCurrentlyPlayingFromServer = false; // More descriptive flag
 
 // --- Helper Functions ---
-
-/** Adds a system status message (e.g., connection status) to the chat UI. */
 function addStatusMessage(text, typeClass) {
-  if (!messagesDiv) {
-    console.error("Cannot add status message: messagesDiv not found.");
-    return;
-  }
+  if (!messagesDiv) { console.error("UI_LOG: Cannot add status message: messagesDiv not found."); return; }
+  console.log(`UI_LOG: addStatusMessage - Text: "${text}", Class: "${typeClass}"`);
   try {
     const p = document.createElement("p");
     p.classList.add("system-status-message");
     const span = document.createElement("span");
-    span.className = typeClass; // e.g., "connection-open-text", "error-text"
+    span.className = typeClass;
     span.textContent = text;
     p.appendChild(span);
     messagesDiv.appendChild(p);
-    messagesDiv.scrollTop = messagesDiv.scrollHeight; // Scroll down
-  } catch (e) {
-    console.error("Error adding status message:", e);
-  }
+    messagesDiv.scrollTop = messagesDiv.scrollHeight;
+  } catch (e) { console.error("UI_LOG: Error adding status message:", e); }
 }
 
-/** Displays the 'Thinking...' indicator in the chat UI. */
-function showThinkingIndicator() {
-  hideThinkingIndicator(); // Clear any previous indicator
-  if (!messagesDiv) {
-    console.error("Cannot show thinking indicator: messagesDiv not found.");
-    return;
-  }
-  const wrapper = document.createElement("div");
-  wrapper.id = THINKING_INDICATOR_ID;
-  wrapper.classList.add("message-wrapper", "thinking");
-
-  const iconSpan = document.createElement("span");
-  iconSpan.classList.add("message-icon", "robot-icon");
-  const robotImg = document.createElement("img");
-  robotImg.src = ROBOT_ICON_PATH;
-  robotImg.alt = "Agent icon";
-  iconSpan.appendChild(robotImg);
-
-  const bubbleP = document.createElement("p");
-  bubbleP.classList.add("message-bubble", "thinking-bubble");
-  bubbleP.innerHTML =
-    'Thinking<span class="dots"><span>.</span><span>.</span><span>.</span></span>'; // Animated dots
-
-  wrapper.appendChild(iconSpan);
-  wrapper.appendChild(bubbleP);
-  messagesDiv.appendChild(wrapper);
-  messagesDiv.scrollTop = messagesDiv.scrollHeight;
-  console.log("Showing thinking indicator.");
-}
-
-/** Removes the 'Thinking...' indicator from the chat UI. */
-function hideThinkingIndicator() {
-  const indicatorWrapper = document.getElementById(THINKING_INDICATOR_ID);
-  if (indicatorWrapper) {
-    indicatorWrapper.remove();
-    console.log("Hiding thinking indicator.");
-  }
-}
-
-/** Adds a user or server message to the chat UI. */
-function addMessageToUI(messageText, senderType) {
-  if (!messagesDiv) {
-    console.error("Cannot add message: messagesDiv not found.");
-    return;
-  }
-
-  const wrapper = document.createElement("div");
-  wrapper.classList.add("message-wrapper", senderType); // 'user' or 'server'
-
-  const iconSpan = document.createElement("span");
-  iconSpan.classList.add("message-icon");
-
-  const bubbleP = document.createElement("p");
-  bubbleP.classList.add("message-bubble");
-
-  if (senderType === "user") {
-    iconSpan.classList.add("user-icon");
-    iconSpan.textContent = "👤";
-    bubbleP.classList.add("user-message");
-    bubbleP.textContent = messageText; // Display user messages as plain text
-  } else {
-    // Server message
-    iconSpan.classList.add("robot-icon");
+function showThinkingIndicator(isVoice = false) {
+    hideThinkingIndicator();
+    if (!messagesDiv) { console.error("UI_LOG: Cannot show thinking indicator: messagesDiv not found."); return;}
+    const wrapper = document.createElement("div");
+    wrapper.id = THINKING_INDICATOR_ID;
+    wrapper.classList.add("message-wrapper", "thinking");
+    const iconSpan = document.createElement("span");
+    iconSpan.classList.add("message-icon", "robot-icon");
     const robotImg = document.createElement("img");
-    robotImg.src = ROBOT_ICON_PATH;
-    robotImg.alt = "Agent icon";
+    robotImg.src = ROBOT_ICON_PATH; robotImg.alt = "Agent icon";
     iconSpan.appendChild(robotImg);
-    bubbleP.classList.add("server-message-block");
-
-    // Attempt to render server messages as Markdown
-    try {
-      if (typeof marked !== "undefined") {
-        bubbleP.innerHTML = marked.parse(messageText); // Use marked library
-      } else {
-        console.warn(
-          "Marked library not loaded, displaying raw server message.",
-        );
-        bubbleP.textContent = messageText; // Fallback
-      }
-    } catch (e) {
-      console.error("Error parsing server Markdown:", e);
-      bubbleP.textContent = messageText; // Fallback on error
-      addStatusMessage(`Markdown parsing error: ${e.message}`, "error-text");
-    }
-  }
-
-  wrapper.appendChild(iconSpan);
-  wrapper.appendChild(bubbleP);
-  messagesDiv.appendChild(wrapper);
-  messagesDiv.scrollTop = messagesDiv.scrollHeight; // Scroll down
+    const bubbleP = document.createElement("p");
+    bubbleP.classList.add("message-bubble", "thinking-bubble");
+    const thinkingText = isVoice ? "Listening..." : "Thinking";
+    bubbleP.innerHTML = `${thinkingText}<span class="dots"><span>.</span><span>.</span><span>.</span></span>`;
+    wrapper.appendChild(iconSpan);
+    wrapper.appendChild(bubbleP);
+    messagesDiv.appendChild(wrapper);
+    messagesDiv.scrollTop = messagesDiv.scrollHeight;
+    console.log(isVoice ? "UI_LOG: Showing listening indicator." : "UI_LOG: Showing thinking indicator.");
 }
 
-// --- WebSocket Event Handlers ---
+function hideThinkingIndicator() {
+  const indicator = document.getElementById(THINKING_INDICATOR_ID);
+  if (indicator) {
+    indicator.remove();
+    console.log("UI_LOG: Hiding thinking/listening indicator.");
+  }
+}
 
-function handleWebSocketOpen(event) {
-  console.log("WebSocket connection opened successfully:", event.target.url);
-  reconnectAttempts = 0; // Reset counter
+function addMessageToUI(messageText, senderType, isMarkdown = true) {
+    if (!messagesDiv) { console.error("UI_LOG: Cannot add message: messagesDiv not found."); return; }
+    console.log(`UI_LOG: addMessageToUI - Sender: ${senderType}, Text: "${messageText.substring(0, 50)}..."`);
+    hideThinkingIndicator(); 
+    const wrapper = document.createElement("div"); // ... (rest of your addMessageToUI)
+    wrapper.classList.add("message-wrapper", senderType);
+    const iconSpan = document.createElement("span");
+    iconSpan.classList.add("message-icon");
+    const bubbleP = document.createElement("p");
+    bubbleP.classList.add("message-bubble");
+
+    if (senderType === "user") {
+        iconSpan.classList.add("user-icon");
+        iconSpan.innerHTML = `<span class="material-icons-outlined">person</span>`;
+        bubbleP.classList.add("user-message");
+        bubbleP.textContent = messageText;
+    } else { 
+        iconSpan.classList.add("robot-icon");
+        const robotImg = document.createElement("img");
+        robotImg.src = ROBOT_ICON_PATH; robotImg.alt = "Agent icon";
+        iconSpan.appendChild(robotImg);
+        bubbleP.classList.add("server-message-block");
+        if (isMarkdown && typeof marked !== "undefined") {
+            try { bubbleP.innerHTML = marked.parse(messageText); }
+            catch (e) { console.error("UI_LOG: Error parsing Markdown:", e); bubbleP.textContent = messageText;}
+        } else { bubbleP.textContent = messageText; }
+    }
+    wrapper.appendChild(iconSpan);
+    wrapper.appendChild(bubbleP);
+    messagesDiv.appendChild(wrapper);
+    messagesDiv.scrollTop = messagesDiv.scrollHeight;
+}
+
+// --- Text WebSocket Handlers ---
+function handleTextWebSocketOpen(event) {
+  console.log("UI_LOG: Text WebSocket connection opened:", event.target.url);
+  reconnectAttempts = 0;
   if (sendButton) sendButton.disabled = false;
-  addStatusMessage("Connection established", "connection-open-text");
-  addSubmitHandler(); // Ensure form submit handler is active
+  if (micButton) micButton.disabled = false;
+  addStatusMessage("Text chat connected", "connection-open-text");
+  addSubmitHandler();
 }
-
-function handleWebSocketMessage(event) {
-  hideThinkingIndicator();
-  try {
-    const packet = JSON.parse(event.data);
-    if (packet.turn_complete === true) {
-      console.log("Turn complete signal received.");
-      // Optionally re-enable input or other actions here
-      return;
-    }
-    if (packet.message) {
-      addMessageToUI(packet.message, "server");
-    } else {
-      console.warn("Received packet without 'message' field:", packet);
-    }
-  } catch (parseError) {
-    console.error(
-      "Error parsing WebSocket message:",
-      parseError,
-      "Raw data:",
-      event.data,
-    );
-    addStatusMessage(
-      `Error processing server message: ${parseError.message}`,
-      "error-text",
-    );
-    addMessageToUI(`Received non-JSON data: ${event.data}`, "server"); // Display raw data
-  }
-}
-
-function handleWebSocketClose(event) {
-  console.warn(
-    `WebSocket connection closed. Code: ${event.code}, Reason: '${
-      event.reason || "No reason given"
-    }', Was Clean: ${event.wasClean}`,
-  );
-  hideThinkingIndicator();
-  if (sendButton) sendButton.disabled = true;
-  removeSubmitHandler(); // Prevent sending on closed connection
-
-  // Reconnection logic for unclean closures
-  if (!event.wasClean && reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
-    reconnectAttempts++;
-    const reconnectDelay = Math.min(
-      30000, // Max 30s delay
-      RECONNECT_BASE_DELAY_MS * Math.pow(2, reconnectAttempts - 1), // Exponential backoff
-    );
-    addStatusMessage(
-      `Connection closed. Attempting reconnect ${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS} in ${Math.round(
-        reconnectDelay / 1000,
-      )}s...`,
-      "connection-closed-text",
-    );
-    setTimeout(connectWebSocket, reconnectDelay);
-  } else if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
-    console.error("Max reconnection attempts reached.");
-    addStatusMessage(
-      "Connection lost permanently. Max reconnection attempts reached. Please reload the page.",
-      "error-text",
-    );
-  } else {
-    // Clean closure
-    addStatusMessage("Connection closed.", "connection-closed-text");
-  }
-}
-
-function handleWebSocketError(error) {
-  console.error("WebSocket error occurred:", error);
-  hideThinkingIndicator();
-  addStatusMessage(
-    "WebSocket connection error. See browser console.",
-    "error-text",
-  );
-  // onclose will likely be called after this
-}
-
-/** Attaches all necessary event listeners to the WebSocket instance. */
-function addWebSocketHandlers(webSocketInstance) {
-  webSocketInstance.onopen = handleWebSocketOpen;
-  webSocketInstance.onmessage = handleWebSocketMessage;
-  webSocketInstance.onclose = handleWebSocketClose;
-  webSocketInstance.onerror = handleWebSocketError;
-  console.log("WebSocket event handlers attached for:", webSocketInstance.url);
-}
-
-// --- Form Submission ---
-
-/** Handles the message form submission. */
-function submitMessageHandler(e) {
-  e.preventDefault(); // Prevent page reload
-
-  if (!ws || ws.readyState !== WebSocket.OPEN) {
-    console.warn("Attempted send, but WebSocket is not open.");
-    addStatusMessage(
-      "Cannot send message - Connection not active.",
-      "error-text",
-    );
-    return false;
-  }
-  if (!messageInput) {
-    console.error("Cannot send message: messageInput is missing.");
-    return false;
-  }
-
-  const messageText = messageInput.value.trim();
-  if (messageText) {
-    addMessageToUI(messageText, "user");
-    showThinkingIndicator();
+function handleTextWebSocketMessage(event) { /* ... as before ... */ 
+    console.log("UI_LOG: TextWS received message:", event.data);
+    hideThinkingIndicator();
     try {
-      console.log("Sending message:", messageText);
-      ws.send(messageText); // Send raw text
-      messageInput.value = ""; // Clear input
-      messageInput.focus();
-    } catch (error) {
-      console.error("Error sending message via WebSocket:", error);
-      hideThinkingIndicator();
-      addStatusMessage(
-        `Failed to send message: ${error.message}`,
-        "error-text",
-      );
-      // Add visual feedback to the failed user message
-      const lastUserBubble = messagesDiv?.querySelector(
-        ".message-wrapper.user:last-child .message-bubble",
-      );
-      if (lastUserBubble) {
-        const errorSpan = document.createElement("span");
-        errorSpan.textContent = " (Send Error)";
-        errorSpan.style.color = "var(--status-error, #dc3545)"; // Use CSS var or fallback
-        errorSpan.style.fontSize = "0.8em";
-        lastUserBubble.appendChild(errorSpan);
-      }
+        const packet = JSON.parse(event.data);
+        if (packet.message) { addMessageToUI(packet.message, "server"); }
+        else { console.warn("UI_LOG: Received text packet without 'message':", packet); }
+    } catch (e) {
+        console.error("UI_LOG: Error parsing text WS message:", e, "Raw:", event.data);
+        addStatusMessage(`Error processing server text: ${e.message}`, "error-text");
+        addMessageToUI(`Received non-JSON: ${event.data}`, "server", false);
     }
-  } else {
-    console.log("Empty message submission ignored.");
-  }
-  return false; // Prevent default just in case
+}
+function handleTextWebSocketClose(event) { /* ... as before ... */ 
+    console.warn(`UI_LOG: Text WebSocket closed. Code: ${event.code}, Clean: ${event.wasClean}`);
+    hideThinkingIndicator();
+    if (sendButton) sendButton.disabled = true;
+    removeSubmitHandler();
+    addStatusMessage("Text chat disconnected.", "connection-closed-text");
+}
+function handleTextWebSocketError(error) { /* ... as before ... */ 
+    console.error("UI_LOG: Text WebSocket error:", error);
+    hideThinkingIndicator();
+    addStatusMessage("Text WebSocket connection error.", "error-text");
+}
+function addTextWebSocketHandlers(wsInstance) { /* ... as before ... */ 
+    wsInstance.onopen = handleTextWebSocketOpen;
+    wsInstance.onmessage = handleTextWebSocketMessage;
+    wsInstance.onclose = handleTextWebSocketClose;
+    wsInstance.onerror = handleTextWebSocketError;
+}
+function connectTextWebSocket() { /* ... as before ... */ 
+    const sessionId = `text-${Math.random().toString(36).substring(2, 10)}`;
+    const wsProtocol = window.location.protocol === "https:" ? "wss://" : "ws://";
+    const wsUrl = wsProtocol + window.location.host + "/ws/" + sessionId;
+    console.log(`UI_LOG: Attempting Text WebSocket connect: ${wsUrl}`);
+    try {
+        if (textWs && textWs.readyState !== WebSocket.CLOSED) textWs.close();
+        textWs = new WebSocket(wsUrl);
+        addTextWebSocketHandlers(textWs);
+    } catch (error) { console.error("UI_LOG: Error creating Text WS:", error); }
 }
 
-/** Attaches the submit event listener to the form. */
-function addSubmitHandler() {
-  if (messageForm && submitMessageHandler) {
-    messageForm.removeEventListener("submit", submitMessageHandler); // Prevent duplicates
-    messageForm.addEventListener("submit", submitMessageHandler);
-    console.log("Submit handler assigned to form.");
-  } else {
-    console.error(
-      "Cannot add submit handler: Message form or handler missing!",
-    );
-  }
+// --- Voice WebSocket Handlers ---
+function handleVoiceWebSocketOpen(event) {
+    console.log("UI_LOG: Voice WebSocket connection opened:", event.target.url);
+    addStatusMessage("Voice channel connected", "connection-open-text");
+    if (micButton) micButton.disabled = false;
+    if (micIcon) micIcon.textContent = "mic";
+    if (micButton) micButton.classList.remove("is-listening");
 }
 
-/** Removes the submit event listener from the form. */
-function removeSubmitHandler() {
-  if (messageForm && submitMessageHandler) {
-    messageForm.removeEventListener("submit", submitMessageHandler);
-    console.log("Submit handler removed from form.");
-  }
-}
 
-// --- WebSocket Connection ---
-
-/** Establishes or re-establishes the WebSocket connection. */
-function connectWebSocket() {
-  // Generate session ID and URL only when connecting
-  const sessionId = Math.random().toString(36).substring(2, 15);
-  const wsProtocol = window.location.protocol === "https:" ? "wss://" : "ws://";
-  const wsUrl = wsProtocol + window.location.host + "/ws/" + sessionId;
-
-  console.log(
-    `Attempting WebSocket connect: ${wsUrl} (Attempt: ${reconnectAttempts + 1})`,
-  );
-
-  try {
-    // Ensure any previous connection is closed before creating a new one
-    if (ws && ws.readyState !== WebSocket.CLOSED) {
-      console.log("Closing existing WebSocket before reconnecting.");
-      ws.close(1000, "Reconnecting"); // 1000 = Normal Closure
-    }
-
-    ws = new WebSocket(wsUrl);
-    addWebSocketHandlers(ws); // Attach handlers to the new instance
-  } catch (error) {
-    console.error("Error creating WebSocket instance:", error);
-    addStatusMessage(
-      `Failed to initialize connection: ${error.message}`,
-      "error-text",
-    );
-    // Attempt retry if creation fails (similar to onclose logic)
-    if (reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
-      reconnectAttempts++;
-      const reconnectDelay = Math.min(
-        30000,
-        RECONNECT_BASE_DELAY_MS * Math.pow(2, reconnectAttempts - 1),
-      );
-      addStatusMessage(
-        `Retrying connection in ${Math.round(reconnectDelay / 1000)}s...`,
-        "connection-closed-text",
-      );
-      setTimeout(connectWebSocket, reconnectDelay);
+async function handleVoiceWebSocketMessage(event) {
+    console.log("UI_LOG: VoiceWS received data - Type:", typeof event.data, "Is ArrayBuffer:", event.data instanceof ArrayBuffer, "Is Blob:", event.data instanceof Blob);
+    if (event.data instanceof ArrayBuffer || event.data instanceof Blob) {
+        const byteLength = event.data.byteLength || event.data.size;
+        console.log(`UI_LOG: VoiceWS is processing BINARY data: ${byteLength} bytes`);
+        const audioData = event.data instanceof Blob ? await event.data.arrayBuffer() : event.data;
+        if (byteLength > 0) {
+            browserAudioPlaybackQueue.push(audioData); // Add chunk to queue
+            playNextChunkFromQueue();                 // Attempt to play if not already playing
+        } else {
+            console.warn("UI_LOG: VoiceWS received empty binary data chunk.");
+        }
+    } else if (typeof event.data === 'string') {
+        // ... (your existing JSON parsing for gemini_transcript etc.) ...
+        // (This part for text messages like transcripts seems fine)
+        console.log("UI_LOG: VoiceWS received TEXT data:", event.data);
+        try {
+            const packet = JSON.parse(event.data);
+            console.log("UI_LOG: VoiceWS parsed JSON packet:", packet);
+            if (packet.type === "gemini_transcript") {
+                console.log("UI_LOG: Gemini Transcript to display:", packet.text);
+                hideThinkingIndicator(); 
+                addMessageToUI(packet.text, "server"); 
+            } else if (packet.type === "user_transcript") {
+                console.log("UI_LOG: User Transcript:", packet.text);
+                // Potentially display this as a user message if desired
+                addMessageToUI(packet.text, "user"); 
+                showThinkingIndicator(false); 
+            } else if (packet.type === "error") {
+                console.error("UI_LOG: Error from voice server:", packet.message);
+                addStatusMessage(`Voice Agent Error: ${packet.message}`, "error-text");
+                stopListening();
+            } else {
+                console.log("UI_LOG: Received unknown text packet from voice server:", packet);
+            }
+            
+        } catch (e) { console.error("UI_LOG: Error parsing JSON from voice server:", e); }
     } else {
-      addStatusMessage(
-        "Failed to initialize connection after multiple attempts. Please reload.",
-        "error-text",
-      );
+        console.warn("UI_LOG: VoiceWS received data of unexpected type:", typeof event.data);
     }
-  }
+}
+
+
+function handleVoiceWebSocketClose(event) {
+    console.warn(`UI_LOG: Voice WebSocket closed. Code: ${event.code}, Clean: ${event.wasClean}, Reason: ${event.reason}`);
+    stopListening();
+    if (micButton) micButton.disabled = false; // Allow user to try reconnecting by clicking mic
+    addStatusMessage("Voice channel disconnected.", "connection-closed-text");
+    voiceWs = null;
+}
+
+function handleVoiceWebSocketError(error) {
+    console.error("UI_LOG: Voice WebSocket error:", error);
+    stopListening();
+    if (micButton) micButton.disabled = false;
+    addStatusMessage("Voice WebSocket connection error.", "error-text");
+    voiceWs = null;
+}
+
+function addVoiceWebSocketHandlers(wsInstance) {
+    wsInstance.binaryType = "arraybuffer";
+    wsInstance.onopen = handleVoiceWebSocketOpen;
+    wsInstance.onmessage = handleVoiceWebSocketMessage;
+    wsInstance.onclose = handleVoiceWebSocketClose;
+    wsInstance.onerror = handleVoiceWebSocketError;
+    console.log("UI_LOG: Voice WebSocket event handlers attached.");
+}
+
+function connectVoiceWebSocket() {
+    if (voiceWs && voiceWs.readyState === WebSocket.OPEN) { /* ... as before ... */ return Promise.resolve(voiceWs); }
+    if (voiceWs && voiceWs.readyState === WebSocket.CONNECTING) { /* ... as before ... */ 
+        return new Promise((resolve, reject) => { /* ... */ });
+    }
+    const sessionId = `voice-${Math.random().toString(36).substring(2, 10)}`;
+    const wsProtocol = window.location.protocol === "https:" ? "wss://" : "ws://";
+    const wsUrl = wsProtocol + window.location.host + VOICE_WEBSOCKET_ENDPOINT + sessionId;
+    console.log(`UI_LOG: Attempting Voice WebSocket connect: ${wsUrl}`);
+    return new Promise((resolve, reject) => {
+        try {
+            voiceWs = new WebSocket(wsUrl);
+            addVoiceWebSocketHandlers(voiceWs);
+            const originalOnOpen = voiceWs.onopen;
+            voiceWs.onopen = (event) => { if (originalOnOpen) originalOnOpen(event); resolve(voiceWs); };
+            const originalOnError = voiceWs.onerror;
+            voiceWs.onerror = (event) => { if (originalOnError) originalOnError(event); reject(new Error("Voice WS connection failed"));};
+        } catch (error) { /* ... */ reject(error); }
+    });
+}
+
+// --- Web Audio API Logic ---
+async function startMicrophone() {
+    console.log("UI_LOG: startMicrophone called.");
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) { /* ... */ return null; }
+    try {
+        if (!audioContext) {
+            audioContext = new (window.AudioContext || window.webkitAudioContext)();
+            console.log("UI_LOG: AudioContext created. Initial state:", audioContext.state);
+        }
+        if (audioContext.state === 'suspended') {
+            console.log("UI_LOG: AudioContext is suspended, attempting to resume...");
+            await audioContext.resume();
+            console.log("UI_LOG: AudioContext resumed. Current state:", audioContext.state);
+        }
+
+        mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+        console.log("UI_LOG: Microphone access granted.");
+        const source = audioContext.createMediaStreamSource(mediaStream);
+        const bufferSize = 4096; // ~250ms at 16kHz, ~85ms at 48kHz. A common value.
+        audioProcessorNode = audioContext.createScriptProcessor(bufferSize, 1, 1);
+        
+        audioProcessorNode.onaudioprocess = (audioProcessingEvent) => {
+            if (!isListening || !voiceWs || voiceWs.readyState !== WebSocket.OPEN) return;
+            const inputData = audioProcessingEvent.inputBuffer.getChannelData(0);
+            // console.log("UI_LOG: onaudioprocess - Raw input data length:", inputData.length); // Very verbose
+            const downsampledData = downsampleBuffer(inputData, audioContext.sampleRate, TARGET_SAMPLE_RATE);
+            const int16Pcm = convertFloat32ToInt16(downsampledData);
+            if (int16Pcm.buffer.byteLength > 0) {
+                 console.log(`UI_LOG: onaudioprocess - Sending ${int16Pcm.buffer.byteLength} bytes (16kHz, 16-bit PCM).`);
+                 voiceWs.send(int16Pcm.buffer);
+            }
+        };
+        source.connect(audioProcessorNode);
+        audioProcessorNode.connect(audioContext.destination); // Necessary for onaudioprocess to fire
+        console.log("UI_LOG: Microphone started & connected to processor. Browser's AudioContext sample rate:", audioContext.sampleRate);
+        return mediaStream;
+    } catch (err) { /* ... (your existing error handling) ... */ 
+        console.error("UI_LOG: Error in startMicrophone:", err);
+        return null;
+    }
+}
+
+function stopMicrophone() {
+    console.log("UI_LOG: stopMicrophone called.");
+    if (mediaStream) { /* ... */ }
+    if (audioProcessorNode) { /* ... */ }
+    // ... (as before)
+    if (mediaStream) {
+        mediaStream.getTracks().forEach(track => track.stop());
+        mediaStream = null;
+        console.log("UI_LOG: Microphone stream tracks stopped.");
+    }
+    if (audioProcessorNode) {
+        audioProcessorNode.disconnect(); // Disconnect from source and destination
+        audioProcessorNode.onaudioprocess = null; // Remove handler
+        audioProcessorNode = null;
+        console.log("UI_LOG: AudioProcessorNode disconnected.");
+    }
+}
+
+function downsampleBuffer(buffer, inputRate, outputRate) { /* ... as before ... */ 
+    if (inputRate === outputRate) return buffer;
+    const ratio = inputRate / outputRate;
+    const newLength = Math.round(buffer.length / ratio);
+    const result = new Float32Array(newLength);
+    let i = 0, j = 0;
+    while (i < newLength) {
+        result[i++] = buffer[Math.floor(j)];
+        j += ratio;
+    }
+    return result;
+}
+function convertFloat32ToInt16(buffer) { /* ... as before ... */ 
+    let l = buffer.length; const buf = new Int16Array(l);
+    while (l--) { buf[l] = Math.min(1, buffer[l]) * 0x7FFF; }
+    return buf;
+}
+
+
+// --- NEW/MODIFIED: Audio Playback with Queuing ---
+async function playNextChunkFromQueue() {
+    if (isPlayingAudio || browserAudioPlaybackQueue.length === 0) {
+        // If already playing or queue is empty, do nothing now.
+        // The 'ended' event of the current playback will trigger the next.
+        if (browserAudioPlaybackQueue.length === 0) console.log("UI_LOG: Playback queue empty.");
+        if (isPlayingAudio) console.log("UI_LOG: Already playing audio, new chunk queued.");
+        return;
+    }
+
+    isPlayingAudio = true; // Set flag
+    const arrayBuffer = browserAudioPlaybackQueue.shift(); // Get next chunk from queue
+
+    console.log("UI_LOG: playNextChunkFromQueue - Playing chunk of size:", arrayBuffer.byteLength);
+
+    if (!audioContext) {
+        audioContext = new (window.AudioContext || window.webkitAudioContext)();
+        console.log("UI_LOG: AudioContext initialized for playback. State:", audioContext.state);
+    }
+    if (audioContext.state === 'suspended') {
+        console.log("UI_LOG: AudioContext is suspended (playback), attempting to resume...");
+        try {
+            await audioContext.resume();
+            console.log("UI_LOG: AudioContext resumed successfully for playback. State:", audioContext.state);
+        } catch (e) {
+            console.error("UI_LOG: Error resuming AudioContext for playback:", e);
+            addStatusMessage("Could not start audio. Click page & try mic again.", "error-text");
+            isPlayingAudio = false; // Reset flag
+            // Consider re-queuing the chunk or handling the error more robustly
+            return;
+        }
+    }
+
+    if (!arrayBuffer || arrayBuffer.byteLength === 0) {
+        console.warn("UI_LOG: playNextChunkFromQueue - Attempted to play empty chunk.");
+        isPlayingAudio = false; // Reset flag
+        playNextChunkFromQueue(); // Try next if any
+        return;
+    }
+
+    try {
+        const int16Array = new Int16Array(arrayBuffer);
+        const float32Array = new Float32Array(int16Array.length);
+        for (let i = 0; i < int16Array.length; i++) {
+            float32Array[i] = int16Array[i] / 32768.0;
+        }
+
+        const audioBuffer = audioContext.createBuffer(
+            1,                          // channels
+            float32Array.length,        // frames
+            expectedPlaybackSampleRate  // sample rate (24000 for Gemini output)
+        );
+        audioBuffer.getChannelData(0).set(float32Array);
+
+        const source = audioContext.createBufferSource();
+        source.buffer = audioBuffer;
+        source.connect(audioContext.destination);
+        
+        source.onended = () => {
+            console.log("UI_LOG: Playback of a chunk truly ended.");
+            source.disconnect(); // Clean up the node
+            isPlayingAudio = false; // Reset flag
+            playNextChunkFromQueue(); // Play next chunk in queue if any
+        };
+        
+        console.log("UI_LOG: playNextChunkFromQueue - Starting playback (source.start()).");
+        source.start();
+
+    } catch (e) {
+        console.error("UI_LOG: Error playing audio chunk in Web Audio API:", e);
+        addStatusMessage("Error playing audio response.", "error-text");
+        isPlayingAudio = false; // Reset flag
+        playNextChunkFromQueue(); // Attempt next chunk even if current one fails (maybe)
+    }
+}
+
+
+// --- Mic Button Logic ---
+async function toggleListening() {
+    console.log("UI_LOG: toggleListening called. isListening:", isListening);
+    if (!voiceWs || voiceWs.readyState !== WebSocket.OPEN) {
+        addStatusMessage("Connecting to voice service...", "connection-open-text");
+        if (micButton) micButton.disabled = true;
+        try {
+            await connectVoiceWebSocket();
+            console.log("UI_LOG: Voice WebSocket connection successful (from toggleListening).");
+            // handleVoiceWebSocketOpen should have re-enabled micButton if successful
+        } catch (err) {
+            console.error("UI_LOG: Failed to connect voice WebSocket on toggle:", err);
+            if (micButton) micButton.disabled = false;
+            addStatusMessage("Failed to connect to voice service.", "error-text");
+            return;
+        }
+    }
+    
+    if (isListening) {
+        stopListening();
+    } else {
+        // Ensure AudioContext is running before starting microphone
+        if (!audioContext || audioContext.state === 'suspended') {
+            if(!audioContext) audioContext = new (window.AudioContext || window.webkitAudioContext)();
+            try {
+                console.log("UI_LOG: Resuming AudioContext before starting microphone.");
+                await audioContext.resume();
+                console.log("UI_LOG: AudioContext resumed for mic start. State:", audioContext.state);
+            } catch (e) {
+                console.error("UI_LOG: Could not resume audio context on mic press:", e);
+                addStatusMessage("Audio system could not start. Please click again.", "error-text");
+                return;
+            }
+        }
+
+        const stream = await startMicrophone(); // startMicrophone also tries to resume context
+        if (stream) {
+            isListening = true;
+            micIcon.textContent = "mic_off";
+            micButton.classList.add("is-listening");
+            if (messageInput) messageInput.disabled = true;
+            if (sendButton) sendButton.disabled = true;
+            showThinkingIndicator(true);
+            addStatusMessage("Listening... Speak now.", "connection-open-text");
+        } else {
+            console.error("UI_LOG: Failed to start microphone in toggleListening.");
+            // Potentially reset micButton state if startMicrophone failed
+             if (micIcon) micIcon.textContent = "mic";
+             if (micButton) micButton.classList.remove("is-listening");
+        }
+    }
+}
+
+function stopListening() {
+    console.log("UI_LOG: stopListening called. Current isListening state:", isListening);
+    if (isListening) { // Only run if actually listening
+        stopMicrophone();
+        isListening = false; // Set before UI updates
+        if (micIcon) micIcon.textContent = "mic";
+        if (micButton) micButton.classList.remove("is-listening");
+        if (messageInput) messageInput.disabled = false;
+        if (sendButton && textWs && textWs.readyState === WebSocket.OPEN) sendButton.disabled = false;
+        hideThinkingIndicator();
+        addStatusMessage("Stopped listening.", "connection-closed-text");
+    } else { // If called when not listening, just ensure UI is correct
+        if (micIcon) micIcon.textContent = "mic";
+        if (micButton) micButton.classList.remove("is-listening");
+    }
+}
+
+// --- Form Submission (Text) ---
+function submitMessageHandler(e) { /* ... as before ... */ 
+    e.preventDefault();
+    if (!textWs || textWs.readyState !== WebSocket.OPEN) { return false; }
+    const messageText = messageInput.value.trim();
+    if (messageText) {
+        addMessageToUI(messageText, "user");
+        showThinkingIndicator(false);
+        try {
+            textWs.send(JSON.stringify({ message: messageText })); // Send as JSON for text chat
+            messageInput.value = ""; messageInput.focus();
+        } catch (error) { 
+            console.error("UI_LOG: Error sending text message:", error);
+            hideThinkingIndicator();
+            addStatusMessage(`Failed to send: ${error.message}`, "error-text");
+        }
+    }
+    return false;
+}
+function addSubmitHandler() { /* ... as before ... */ 
+    if (messageForm && submitMessageHandler) {
+        messageForm.removeEventListener("submit", submitMessageHandler);
+        messageForm.addEventListener("submit", submitMessageHandler);
+        console.log("UI_LOG: Text submit handler assigned.");
+    }
+}
+function removeSubmitHandler() { /* ... as before ... */ 
+    if (messageForm && submitMessageHandler) {
+        messageForm.removeEventListener("submit", submitMessageHandler);
+        console.log("UI_LOG: Text submit handler removed.");
+    }
 }
 
 // --- Initialization ---
-
-/**
- * Initializes the WebSocket application. Finds necessary DOM elements
- * and initiates the first WebSocket connection attempt.
- */
 export function initWebSocketApp() {
-  if (appInitialized) {
-    console.warn("WebSocket app already initialized. Skipping.");
-    return;
-  }
-
-  console.log("Initializing WebSocket application logic...");
-
-  // Find essential DOM elements
-  messageForm = document.getElementById("message-form");
+  if (appInitialized) { console.warn("UI_LOG: WebSocket app already initialized."); return; }
+  console.log("UI_LOG: Initializing WebSocket application logic (Text & Voice)...");
+  messageForm = document.getElementById("message-form"); /* ... all element getters ... */
   messageInput = document.getElementById("message");
   messagesDiv = document.getElementById("messages");
   sendButton = document.getElementById("send-button");
-  const appTab = document.getElementById("app-tab-content"); // Container for error messages
+  micButton = document.getElementById("mic-button");
+  micIcon = document.getElementById("mic-icon");
 
-  // Critical check for UI elements
-  if (!messageForm || !messageInput || !messagesDiv || !sendButton) {
-    console.error("CRITICAL: One or more required app DOM elements not found!");
-    const errorMsg =
-      "<p class='system-status-message'><span class='error-text'>Initialization Error: Required UI elements missing. App cannot start.</span></p>";
-    if (appTab) {
-      const appContainer = appTab.querySelector(".app-container"); // Try to find inner container
-      if (appContainer) appContainer.innerHTML = errorMsg;
-      else appTab.innerHTML = errorMsg; // Fallback to replacing tab content
-    } else {
-      // Fallback if even the app tab is missing
-      alert(
-        "Initialization Error: App UI elements missing and app tab not found.",
-      );
-    }
-    return; // Stop initialization
-  }
-
-  console.log("App UI Elements successfully located.");
-  if (sendButton) sendButton.disabled = true; // Disable send until connected
-
-  appInitialized = true; // Mark as initialized
-  connectWebSocket(); // Start the connection process
-  console.log("WebSocket App module initialized and connection initiated.");
+  if (!messageForm || !messageInput || !messagesDiv || !sendButton || !micButton || !micIcon) { /* ... error ... */ return; }
+  console.log("UI_LOG: All essential UI elements found.");
+  if (sendButton) sendButton.disabled = true;
+  if (micButton) micButton.disabled = true;
+  micButton.addEventListener("click", toggleListening);
+  console.log("UI_LOG: Mic button event listener added.");
+  appInitialized = true;
+  connectTextWebSocket(); // Text WS connects on load
+  console.log("UI_LOG: WebSocket App module initialized. Text WS connecting. Voice WS on demand.");
 }
