@@ -21,6 +21,7 @@ let audioContext;
 let mediaStream;
 let audioProcessorNode;
 let isListening = false;
+let textWsReconnectAttempts = 0; // Separate counter for text WS
 
 // --- NEW: Audio Playback Queue and State ---
 let browserAudioPlaybackQueue = []; // Array to hold ArrayBuffer chunks
@@ -110,7 +111,7 @@ function addMessageToUI(messageText, senderType, isMarkdown = true) {
 // --- Text WebSocket Handlers ---
 function handleTextWebSocketOpen(event) {
   console.log("UI_LOG: Text WebSocket connection opened:", event.target.url);
-  reconnectAttempts = 0;
+  textWsReconnectAttempts = 0; // Reset counter on successful connection
   if (sendButton) sendButton.disabled = false;
   if (micButton) micButton.disabled = false;
   addStatusMessage("Text chat connected", "connection-open-text");
@@ -134,7 +135,32 @@ function handleTextWebSocketClose(event) { /* ... as before ... */
     hideThinkingIndicator();
     if (sendButton) sendButton.disabled = true;
     removeSubmitHandler();
-    addStatusMessage("Text chat disconnected.", "connection-closed-text");
+    // Only attempt reconnect if it wasn't a clean closure by the client/app explicitly
+    // and we haven't exceeded attempts.
+    // Code 1000 is normal closure. Other codes might indicate issues.
+    // For simplicity, let's try to reconnect on most non-1000 closures or if not explicitly closed by UI.
+    if (event.code !== 1000 && textWsReconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
+        textWsReconnectAttempts++;
+        const reconnectDelay = Math.min(
+            30000,
+            RECONNECT_BASE_DELAY_MS * Math.pow(2, textWsReconnectAttempts - 1)
+        );
+        addStatusMessage(
+            `Text chat disconnected. Attempting reconnect ${textWsReconnectAttempts}/${MAX_RECONNECT_ATTEMPTS} in ${Math.round(reconnectDelay / 1000)}s...`,
+            "connection-closed-text"
+        );
+        setTimeout(connectTextWebSocket, reconnectDelay); // Attempt to reconnect
+    } else if (textWsReconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
+        console.error("UI_LOG: Max text WebSocket reconnection attempts reached.");
+        addStatusMessage(
+            "Text chat connection lost permanently. Please reload the page.",
+            "error-text"
+        );
+    } else {
+        // Clean closure or max attempts not an issue yet, just show disconnected.
+        addStatusMessage("Text chat disconnected.", "connection-closed-text");
+    }
+    textWs = null; // Clear the instance
 }
 function handleTextWebSocketError(error) { /* ... as before ... */ 
     console.error("UI_LOG: Text WebSocket error:", error);
@@ -147,16 +173,35 @@ function addTextWebSocketHandlers(wsInstance) { /* ... as before ... */
     wsInstance.onclose = handleTextWebSocketClose;
     wsInstance.onerror = handleTextWebSocketError;
 }
-function connectTextWebSocket() { /* ... as before ... */ 
+function connectTextWebSocket() {
+    // If already connecting or open, don't try again immediately
+    if (textWs && (textWs.readyState === WebSocket.OPEN || textWs.readyState === WebSocket.CONNECTING)) {
+        console.log("UI_LOG: Text WebSocket already open or connecting.");
+        return;
+    }
+
     const sessionId = `text-${Math.random().toString(36).substring(2, 10)}`;
     const wsProtocol = window.location.protocol === "https:" ? "wss://" : "ws://";
-    const wsUrl = wsProtocol + window.location.host + "/ws/" + sessionId;
-    console.log(`UI_LOG: Attempting Text WebSocket connect: ${wsUrl}`);
+    const wsUrl = wsProtocol + window.location.host + "/ws/" + sessionId; 
+    console.log(`UI_LOG: Attempting Text WebSocket connect: ${wsUrl} (Attempt: ${textWsReconnectAttempts + 1})`);
     try {
-        if (textWs && textWs.readyState !== WebSocket.CLOSED) textWs.close();
+        // Ensure any previous instance is fully closed or nulled before creating new
+        if (textWs) {
+            textWs.onopen = null; textWs.onmessage = null; textWs.onclose = null; textWs.onerror = null;
+            if (textWs.readyState !== WebSocket.CLOSED) {
+                 textWs.close(1000, "Client re-initiating connection");
+            }
+        }
         textWs = new WebSocket(wsUrl);
         addTextWebSocketHandlers(textWs);
-    } catch (error) { console.error("UI_LOG: Error creating Text WS:", error); }
+    } catch (error) { 
+        console.error("UI_LOG: Error creating Text WS instance:", error);
+        // This catch might not be effective for all WebSocket constructor errors.
+        // The onerror handler is more reliable for connection failures.
+        if (handleTextWebSocketClose) { // Check if function exists to avoid error during setup
+            handleTextWebSocketClose({ code: 1006, reason: "Failed to create WebSocket instance", wasClean: false });
+        }
+    }
 }
 
 // --- Voice WebSocket Handlers ---
@@ -176,8 +221,11 @@ async function handleVoiceWebSocketMessage(event) {
         console.log(`UI_LOG: VoiceWS is processing BINARY data: ${byteLength} bytes`);
         const audioData = event.data instanceof Blob ? await event.data.arrayBuffer() : event.data;
         if (byteLength > 0) {
-            browserAudioPlaybackQueue.push(audioData); // Add chunk to queue
-            playNextChunkFromQueue();                 // Attempt to play if not already playing
+             browserAudioPlaybackQueue.push(audioData); // Add chunk to queue
+             console.log(`UI_LOG: Added ${byteLength} bytes to playback queue. Queue size: ${browserAudioPlaybackQueue.length}`);
+             if (!isCurrentlyPlayingFromServer) { // Only start if not already playing
+                 playNextChunkFromQueue();
+             }               // Attempt to play if not already playing
         } else {
             console.warn("UI_LOG: VoiceWS received empty binary data chunk.");
         }
@@ -337,43 +385,57 @@ function convertFloat32ToInt16(buffer) { /* ... as before ... */
 }
 
 
-// --- NEW/MODIFIED: Audio Playback with Queuing ---
+// --- REFINED: Audio Playback with Queuing ---
 async function playNextChunkFromQueue() {
-    if (isPlayingAudio || browserAudioPlaybackQueue.length === 0) {
-        // If already playing or queue is empty, do nothing now.
-        // The 'ended' event of the current playback will trigger the next.
-        if (browserAudioPlaybackQueue.length === 0) console.log("UI_LOG: Playback queue empty.");
-        if (isPlayingAudio) console.log("UI_LOG: Already playing audio, new chunk queued.");
-        return;
+    if (isCurrentlyPlayingFromServer || browserAudioPlaybackQueue.length === 0) {
+        if (browserAudioPlaybackQueue.length === 0 && !isCurrentlyPlayingFromServer) {
+            // console.log("UI_LOG: Playback queue empty and not currently playing.");
+        }
+        return; // Either already playing, or nothing to play
     }
 
-    isPlayingAudio = true; // Set flag
-    const arrayBuffer = browserAudioPlaybackQueue.shift(); // Get next chunk from queue
+    isCurrentlyPlayingFromServer = true; // Set flag: we are now starting a playback sequence
+    const arrayBuffer = browserAudioPlaybackQueue.shift(); // Get next chunk
 
-    console.log("UI_LOG: playNextChunkFromQueue - Playing chunk of size:", arrayBuffer.byteLength);
+    console.log(`UI_LOG: playNextChunkFromQueue - Dequeued chunk. Queue size: ${browserAudioPlaybackQueue.length}. Playing chunk size: ${arrayBuffer.byteLength}`);
 
     if (!audioContext) {
-        audioContext = new (window.AudioContext || window.webkitAudioContext)();
-        console.log("UI_LOG: AudioContext initialized for playback. State:", audioContext.state);
-    }
-    if (audioContext.state === 'suspended') {
-        console.log("UI_LOG: AudioContext is suspended (playback), attempting to resume...");
         try {
-            await audioContext.resume();
-            console.log("UI_LOG: AudioContext resumed successfully for playback. State:", audioContext.state);
+            audioContext = new (window.AudioContext || window.webkitAudioContext)();
+            console.log("UI_LOG: AudioContext initialized for playback. State:", audioContext.state);
+            if (audioContext.state === 'suspended') {
+                console.log("UI_LOG: AudioContext is suspended (playback), attempting to resume...");
+                await audioContext.resume();
+                console.log("UI_LOG: AudioContext resumed successfully for playback. State:", audioContext.state);
+            }
         } catch (e) {
-            console.error("UI_LOG: Error resuming AudioContext for playback:", e);
-            addStatusMessage("Could not start audio. Click page & try mic again.", "error-text");
-            isPlayingAudio = false; // Reset flag
-            // Consider re-queuing the chunk or handling the error more robustly
+            console.error("UI_LOG: Error initializing or resuming AudioContext:", e);
+            addStatusMessage("Audio system error. Please try again.", "error-text");
+            isCurrentlyPlayingFromServer = false; // Reset flag
+            // Optionally, attempt to play the next chunk if there was an error with the context? Or just stop.
             return;
         }
     }
+    // Ensure context is running if already initialized
+    if (audioContext.state === 'suspended') {
+         console.log("UI_LOG: AudioContext was suspended before playback of this chunk, attempting resume...");
+         try {
+            await audioContext.resume();
+            console.log("UI_LOG: AudioContext resumed. Current state:", audioContext.state);
+         } catch(e) {
+            console.error("UI_LOG: Failed to resume AudioContext before playing chunk.", e);
+            isCurrentlyPlayingFromServer = false;
+            // Consider re-adding the chunk to the queue if resume fails
+            // browserAudioPlaybackQueue.unshift(arrayBuffer);
+            return;
+         }
+    }
+
 
     if (!arrayBuffer || arrayBuffer.byteLength === 0) {
-        console.warn("UI_LOG: playNextChunkFromQueue - Attempted to play empty chunk.");
-        isPlayingAudio = false; // Reset flag
-        playNextChunkFromQueue(); // Try next if any
+        console.warn("UI_LOG: playNextChunkFromQueue - Attempted to play empty/null chunk.");
+        isCurrentlyPlayingFromServer = false; // Reset flag
+        playNextChunkFromQueue();       // Immediately try to play the next one if this was invalid
         return;
     }
 
@@ -381,13 +443,13 @@ async function playNextChunkFromQueue() {
         const int16Array = new Int16Array(arrayBuffer);
         const float32Array = new Float32Array(int16Array.length);
         for (let i = 0; i < int16Array.length; i++) {
-            float32Array[i] = int16Array[i] / 32768.0;
+            float32Array[i] = int16Array[i] / 32768.0; 
         }
 
         const audioBuffer = audioContext.createBuffer(
-            1,                          // channels
-            float32Array.length,        // frames
-            expectedPlaybackSampleRate  // sample rate (24000 for Gemini output)
+            1,                          
+            float32Array.length,        
+            expectedPlaybackSampleRate  // 24000 for Gemini output
         );
         audioBuffer.getChannelData(0).set(float32Array);
 
@@ -396,23 +458,23 @@ async function playNextChunkFromQueue() {
         source.connect(audioContext.destination);
         
         source.onended = () => {
-            console.log("UI_LOG: Playback of a chunk truly ended.");
-            source.disconnect(); // Clean up the node
-            isPlayingAudio = false; // Reset flag
-            playNextChunkFromQueue(); // Play next chunk in queue if any
+            console.log("UI_LOG: Playback of an audio chunk (source node) has truly ended.");
+            source.disconnect(); 
+            isCurrentlyPlayingFromServer = false; // Reset flag *after* this one is done
+            playNextChunkFromQueue();       // Now, try to play the next chunk in the queue
         };
         
-        console.log("UI_LOG: playNextChunkFromQueue - Starting playback (source.start()).");
-        source.start();
+        console.log("UI_LOG: playNextChunkFromQueue - Calling source.start() for current chunk.");
+        source.start(); // Play the current chunk
 
     } catch (e) {
-        console.error("UI_LOG: Error playing audio chunk in Web Audio API:", e);
+        console.error("UI_LOG: Error in playNextChunkFromQueue during Web Audio API operations:", e);
         addStatusMessage("Error playing audio response.", "error-text");
-        isPlayingAudio = false; // Reset flag
-        playNextChunkFromQueue(); // Attempt next chunk even if current one fails (maybe)
+        isCurrentlyPlayingFromServer = false; // Reset flag
+        // Optionally try to play the next chunk after an error, or clear queue.
+        // playNextChunkFromQueue(); 
     }
 }
-
 
 // --- Mic Button Logic ---
 async function toggleListening() {
