@@ -12,4 +12,9 @@ dependencies = [
     "mcp>=1.6.0",
     "google-generativeai>=0.8.5",
     "uvicorn>=0.34.1",
+    "tavily-python>=0.5.4",
+    "google-cloud-speech>=2.32.0",
+    "moviepy>=2.1.2",
+    "pydub>=0.2.25.1",
+    "pandas>=2.2.3",
 ]
