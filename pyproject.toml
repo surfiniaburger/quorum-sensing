@@ -17,4 +17,5 @@ dependencies = [
     "moviepy>=2.1.2",
     "pydub>=0.2.25.1",
     "pandas>=2.2.3",
+    "google-genai>=1.11.0"
 ]

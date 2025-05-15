@@ -1,4 +1,3 @@
-
 """
 Main function to run FastAPI server.
 """
@@ -7,33 +6,36 @@ import asyncio
 import contextlib
 from contextlib import asynccontextmanager
 import json
-from typing import Any, Dict, List, Optional, Tuple
+import hashlib
+from typing import Any, Dict, List, Optional, Tuple, AsyncGenerator
+from typing_extensions import override
 from fastapi import HTTPException
 from dotenv import load_dotenv
 from fastapi import FastAPI, WebSocket
 from fastapi.staticfiles import StaticFiles
-from google.adk.agents.llm_agent import LlmAgent
+from google.adk.agents import LlmAgent, BaseAgent, LoopAgent, SequentialAgent # Added BaseAgent, LoopAgent, SequentialAgent
+from google.adk.agents.invocation_context import InvocationContext # Added
 from google.adk.artifacts.in_memory_artifact_service import InMemoryArtifactService
 from google.adk.runners import Runner
 from google.adk.sessions import InMemorySessionService
 from google.adk.tools.mcp_tool.mcp_toolset import MCPToolset, StdioServerParameters
 from google.genai import types
-from pydantic import BaseModel
+from google.adk.events import Event # Added
+from pydantic import BaseModel, Field
 from starlette.websockets import WebSocketDisconnect
-from voice_agent import router as voice_agent_router 
+from voice_agent import router as voice_agent_router
 import logging
-logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(name)s - %(message)s')
 
-from google.adk.runners import Runner
-import inspect
-print("Runner class signature:")
-print(inspect.signature(Runner.__init__))
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(name)s - %(message)s')
+logger = logging.getLogger(__name__) # Use this for consistency
 
 # --- Configuration & Global Setup ---
 load_dotenv()
 
-APP_NAME = "ADK MCP App"
-MODEL_ID = "gemini-2.0-flash"
+APP_NAME = "ADK_MCP_App_Updated" # Changed to avoid potential conflicts if old app is running
+MODEL_ID = "gemini-2.0-flash" # Updated to a generally available model, ensure you have access
+GEMINI_PRO_MODEL_ID = "gemini-2.0-flash" # For potentially more complex tasks like generation/revision
+
 STATIC_DIR = "static"
 
 # Initialize services (globally or via dependency injection)
@@ -41,20 +43,10 @@ session_service = InMemorySessionService()
 artifacts_service = InMemoryArtifactService()
 
 # Global variable to hold loaded MCP tools after lifespan startup
-# This will be accessed by the function called from voice_agent.py
 loaded_mcp_tools_global: Dict[str, Any] = {}
 
 class AllServerConfigs(BaseModel):
-    """
-    Pydantic model to hold configurations for various StdioServerParameters.
-
-    Attributes:
-        configs: A dictionary where keys are server names (e.g., "weather")
-                and values are StdioServerParameters instances.
-    """
-
     configs: Dict[str, StdioServerParameters]
-
 
 # --- Server Parameter Definitions ---
 weather_server_params = StdioServerParameters(
@@ -68,10 +60,17 @@ ct_server_params = StdioServerParameters(
 bnb_server_params = StdioServerParameters(
     command="npx", args=["-y", "@openbnb/mcp-server-airbnb", "--ignore-robots-txt"]
 )
-
 mlb_stats_server_params = StdioServerParameters(
-    command="python", # Or "python3" if that's your interpreter
-    args=["./mcp_server/mlb_stats_server.py"], # Ensure path is correct
+    command="python",
+    args=["./mcp_server/mlb_stats_server.py"],
+)
+web_search_server_params = StdioServerParameters( # NEW
+    command="python",
+    args=["./mcp_server/web_search_server.py"],
+)
+bq_vector_search_server_params = StdioServerParameters( # NEW
+    command="python",
+    args=["./mcp_server/bq_vector_search_server.py"],
 )
 
 server_configs_instance = AllServerConfigs(
@@ -80,55 +79,198 @@ server_configs_instance = AllServerConfigs(
         "bnb": bnb_server_params,
         "ct": ct_server_params,
         "mlb": mlb_stats_server_params,
+        "web_search": web_search_server_params,         # NEW
+        "bq_search": bq_vector_search_server_params, # NEW
     }
 )
 
 # --- Agent Instructions ---
 ROOT_AGENT_INSTRUCTION = """
-**Role:** You are a Virtual Assistant acting as a Request Router. You can help user with questions regarding cocktails, weather, and booking accommodations.
+**Role:** You are a Virtual Assistant acting as a Request Router.
 **Primary Goal:** Analyze user requests and route them to the correct specialist sub-agent.
 **Capabilities & Routing:**
 * **Greetings:** If the user greets you, respond warmly and directly.
 * **Cocktails:** Route requests about cocktails, drinks, recipes, or ingredients to `cocktail_assistant`.
-* **Booking & Weather:** Route requests about booking accommodations (any type) or checking weather to `booking_assistant`.
-* **MLB Information:** Route requests concerning Major League Baseball (MLB) to the `mlb_assistant`. This includes:
-    *   Live game scores, status, and play-by-play summaries.
-    *   Player statistics for a specific game.
-    *   Team schedules.
-    *   Team rosters.
-    *   League standings.
-    The `mlb_assistant` will handle obtaining any necessary IDs (like `game_pk`, `player_id`, `team_id`, `league_id`, `season`) if not provided by the user.
-* **Out-of-Scope:** If the request is unrelated (e.g., general knowledge, math), state directly that you cannot assist with that topic.
+* **Booking & Weather:** Route requests about booking accommodations or weather to `booking_assistant`.
+* **MLB Information (General):** Route general requests concerning Major League Baseball (MLB) stats, scores, schedules, rosters, standings to the `mlb_assistant`.
+    The `mlb_assistant` will handle obtaining any necessary IDs (like `game_pk`, `player_id`, `team_id`) if not provided by the user for these general queries.
+* **MLB Game Recap:** If the user specifically asks for a "game recap", "recap of the game", "game summary" or similar, and a specific game can be identified (e.g., "recap of yesterday's Yankees game" or "recap for game PK 12345"), route the request to the `game_recap_assistant`.
+    - If a `game_pk` is mentioned or easily derivable from the query (e.g. from a team name and date like "yesterday's Yankees game"), include it or the identifying information in the routing.
+    - If the game for the recap is unclear, you can first delegate to `mlb_assistant` to help identify the `game_pk`, and then if `game_pk` is found, the user might be prompted to ask for the recap again, or you could try re-routing. (Simpler: for now, assume if routed to `game_recap_assistant`, the query contains enough info to derive game_pk, or `game_recap_assistant` will handle clarification if needed).
+* **Out-of-Scope:** If the request is unrelated, state directly that you cannot assist.
 **Key Directives:**
-* **Delegate Immediately:** Once a suitable sub-agent is identified, route the request without asking permission.
-* **Do Not Answer Delegated Topics:** You must **not** attempt to answer questions related to cocktails, booking, weather, or MLB information yourself. Always delegate.
-* **Formatting:** Format your final response to the user using Markdown for readability.
+* **Delegate Immediately:** Once a suitable sub-agent is identified, route the request.
+* **Do Not Answer Delegated Topics:** You must **not** attempt to answer questions for delegated topics yourself.
+* **Formatting:** Format your final response using Markdown.
+* **Game Recap Clarification:** If a user asks for a game recap but doesn't specify which game, ask them to specify the game (e.g., "Which game would you like a recap for? Please provide the teams and date, or the game ID if you know it.") before attempting to route to `game_recap_assistant`. If they provide details, then route.
 """
+
+# --- GameRecapAgent Definition (Patterned after StoryFlowAgent) ---
+
+class GameRecapAgent(BaseAgent):
+    """
+    Custom agent for generating and refining an MLB game recap.
+    Orchestrates fetching data, generation, critique, enrichment, and revision.
+    """
+    model_config = {"arbitrary_types_allowed": True}
+
+    # Define sub-agents that will be passed during initialization
+    initial_recap_generator: LlmAgent
+    recap_critic: LlmAgent
+    critique_processor: LlmAgent # Processes critique, stores it, generates search queries, runs searches
+    recap_reviser: LlmAgent
+    grammar_check: LlmAgent
+    tone_check: LlmAgent
+
+    refinement_loop: LoopAgent
+    post_processing_sequence: SequentialAgent
+
+    def __init__(
+        self,
+        name: str,
+
+        initial_recap_generator: LlmAgent,
+        recap_critic: LlmAgent,
+        critique_processor: LlmAgent,
+        recap_reviser: LlmAgent,
+        grammar_check: LlmAgent,
+        tone_check: LlmAgent,
+    ):
+        # Create internal composite agents
+        # The loop will run: Critic -> CritiqueProcessor -> Reviser
+        refinement_loop = LoopAgent(
+            name="RecapRefinementLoop",
+            sub_agents=[recap_critic, critique_processor, recap_reviser],
+            max_iterations=2 # Configurable number of refinement cycles
+        )
+        post_processing_sequence = SequentialAgent(
+            name="RecapPostProcessing",
+            sub_agents=[grammar_check, tone_check]
+        )
+
+        # Define the sub_agents list for the framework
+        # These are the agents that GameRecapAgent directly invokes in its _run_async_impl
+        sub_agents_list = [
+            initial_recap_generator,
+            refinement_loop,
+            post_processing_sequence,
+        ]
+
+        super().__init__(
+            name=name,
+       
+            initial_recap_generator=initial_recap_generator,
+            recap_critic=recap_critic,
+            critique_processor=critique_processor,
+            recap_reviser=recap_reviser,
+            grammar_check=grammar_check,
+            tone_check=tone_check,
+            refinement_loop=refinement_loop,
+            post_processing_sequence=post_processing_sequence,
+            sub_agents=sub_agents_list,
+        )
+
+    @override
+    async def _run_async_impl(
+        self, ctx: InvocationContext
+    ) -> AsyncGenerator[Event, None]:
+        logger.info(f"[{self.name}] Starting game recap workflow.")
+
+        # Correctly get user_query:
+        # 1. Try to get it from session state (if set by a preceding agent or handler)
+        # 2. If not in state, get it from ctx.user_content (the initial message for this invocation)
+        # Get user_query PRIMARILY from session state, as it should have been parsed and placed there by the entry handlers
+        user_query = ctx.session.state.get("user_query")
+
+        if not user_query:
+            # Fallback only if not set by entry handlers (e.g. direct test of GameRecapAgent)
+            logger.warning(f"[{self.name}] 'user_query' not found in session state. Attempting to use ctx.user_content.")
+            if ctx.user_content and ctx.user_content.parts and ctx.user_content.parts[0].text:
+                raw_text_from_content = ctx.user_content.parts[0].text
+                # Check if raw_text_from_content is a JSON string like {"message":"..."}
+                try:
+                    data = json.loads(raw_text_from_content)
+                    if isinstance(data, dict) and "message" in data:
+                        user_query = data["message"]
+                        logger.info(f"[{self.name}] Parsed user_query from ctx.user_content (JSON): '{user_query}'")
+                    else:
+                        user_query = raw_text_from_content # Assume it's plain text
+                        logger.info(f"[{self.name}] Used user_query directly from ctx.user_content (plain text): '{user_query}'")
+                except json.JSONDecodeError:
+                    user_query = raw_text_from_content # Not JSON, use as is
+                    logger.info(f"[{self.name}] Used user_query directly from ctx.user_content (not JSON): '{user_query}'")
+                
+                # Store it back into session state if derived here
+                if user_query:
+                    ctx.session.state["user_query"] = user_query
+            else:
+                user_query = "generic recap request" # Fallback
+                logger.warning(f"[{self.name}] user_query also not in ctx.user_content. Using fallback: '{user_query}'")
+        else:
+            logger.info(f"[{self.name}] Found user_query in session state: '{user_query}'")
+        
+        # Ensure user_query is definitely in state for sub-agents if it was just derived
+        if "user_query" not in ctx.session.state and user_query != "generic recap request":
+             ctx.session.state["user_query"] = user_query
+        if "game_pk" not in ctx.session.state:
+            logger.warning(f"[{self.name}] game_pk not found in session state. InitialRecapGenerator needs to handle this or an error may occur. Current user_query for context: '{user_query}'")
+            # If user_query was just fetched from ctx.user_content and game_pk extraction is desired here:
+            # (This is a simplified example; robust extraction is complex)
+            if user_query: # Ensure user_query is available
+                text_query_lower = user_query.lower()
+                if "game pk" in text_query_lower:
+                    try:
+                        pk_str = text_query_lower.split("game pk")[-1].strip().split(" ")[0]
+                        ctx.session.state["game_pk"] = pk_str # Save to session state
+                        logger.info(f"[{self.name}] Extracted game_pk: {pk_str} from user_query and saved to session state.")
+                    except Exception as e:
+                        logger.info(f"[{self.name}] Could not parse game_pk from '{text_query_lower}': {e}")
+                elif "brewers last game" in text_query_lower: # Example for your query
+                    # This is where you'd need a tool call to figure out the "brewers last game" game_pk
+                    # For now, logging it or setting a placeholder if this agent should handle it:
+                    logger.info(f"[{self.name}] User asked for 'brewers last game', game_pk needs resolution.")
+                    # ctx.session.state["game_pk"] = "NEEDS_RESOLUTION_FOR_BREWERS_LAST_GAME"
+
+
+        logger.info(f"[{self.name}] Running InitialRecapGenerator with game_pk: {ctx.session.state.get('game_pk')}, user_query: {ctx.session.state.get('user_query')}")
+        async for event in self.initial_recap_generator.run_async(ctx):
+            logger.info(f"[{self.name}] Event from InitialRecapGenerator: {event.model_dump_json(indent=2, exclude_none=True)}")
+            yield event
+        
+        # 2. Refinement Loop (Critic -> CritiqueProcessor -> Reviser)
+        logger.info(f"[{self.name}] Running RecapRefinementLoop...")
+        async for event in self.refinement_loop.run_async(ctx):
+            logger.info(f"[{self.name}] Event from RecapRefinementLoop: {event.model_dump_json(indent=2, exclude_none=True)}")
+            yield event
+        
+        logger.info(f"[{self.name}] Recap state after loop: {ctx.session.state.get('current_recap')[:100]}...")
+
+        # 3. Sequential Post-Processing (Grammar and Tone Check)
+        logger.info(f"[{self.name}] Running RecapPostProcessing...")
+        async for event in self.post_processing_sequence.run_async(ctx):
+            logger.info(f"[{self.name}] Event from RecapPostProcessing: {event.model_dump_json(indent=2, exclude_none=True)}")
+            yield event
+
+        # 4. Final Output
+        final_recap = ctx.session.state.get("current_recap", "No recap was finalized.")
+        grammar_sugg = ctx.session.state.get("grammar_suggestions", "")
+        tone_result = ctx.session.state.get("tone_check_result", "")
+
+        logger.info(f"[{self.name}] Workflow finished. Final Recap: {final_recap[:100]}..., Grammar: {grammar_sugg}, Tone: {tone_result}")
+        
+        # The last agent in the sequence or loop should ideally yield the final response.
+        # If not, we can construct and yield one here.
+        # However, ADK typically expects the final agent in a chain to produce the final output event.
+        # We assume current_recap is the main output. The LlmAgent 'reviser' or 'tone_check'
+        # if it's the last one modifying content, should output it correctly.
+        # If the final response is not automatically yielded by the last sub-agent, uncomment below:
+        # yield self.create_final_response_event(ctx, final_recap)
+
 
 # --- Tool Collection ---
 async def _collect_tools_stack(
     server_config_dict: AllServerConfigs,
 ) -> Tuple[Dict[str, Any], contextlib.AsyncExitStack]:
-    """
-    Connects to MCP servers, collects their tools, and returns the tools
-    along with an AsyncExitStack to manage their life cycles.
-
-    This function creates an AsyncExitStack. The caller is responsible
-    for properly closing this stack (e.g., using `await stack.aclose()`)
-    to ensure resources like server connections are cleaned up.
-
-    Args:
-        server_config_dict: An AllServerConfigs object containing the
-                            configurations for the servers to connect to.
-
-    Returns:
-        A tuple containing:
-            - all_tools (Dict[str, Any]): A dictionary where keys are server
-            identifiers (e.g., "weather") and values are the collected tools
-            from that server.
-            - exit_stack (contextlib.AsyncExitStack): The AsyncExitStack managing
-            the context of the connected MCP tool servers.
-    """
     all_tools: Dict[str, Any] = {}
     exit_stack = contextlib.AsyncExitStack()
     stack_needs_closing = False
@@ -136,9 +278,7 @@ async def _collect_tools_stack(
         if not hasattr(server_config_dict, "configs") or not isinstance(
             server_config_dict.configs, dict
         ):
-            logging.error(
-                "server_config_dict does not have a valid '.configs' dictionary."
-            )
+            logging.error("server_config_dict does not have a valid '.configs' dictionary.")
             return {}, exit_stack
         for key, server_params in server_config_dict.configs.items():
             individual_exit_stack: Optional[contextlib.AsyncExitStack] = None
@@ -151,120 +291,215 @@ async def _collect_tools_stack(
                     stack_needs_closing = True
                 if tools:
                     all_tools[key] = tools
+                    logger.info(f"Successfully collected tools for MCP server: {key}")
                 else:
-                    logging.warning(
-                        "Connection successful for key '%s', but no tools returned.",
-                        key,
-                    )
+                    logging.warning("Connection successful for key '%s', but no tools returned.", key)
             except FileNotFoundError as file_error:
-                logging.error(
-                    "Command or script not found for key '%s': %s", key, file_error
-                )
+                logging.error("Command or script not found for key '%s': %s", key, file_error)
             except ConnectionRefusedError as conn_refused:
                 logging.error("Connection refused for key '%s': %s", key, conn_refused)
+            except Exception as e:
+                logging.error(f"Failed to connect or get tools for {key}: {e}", exc_info=True)
+
 
         if not all_tools:
             logging.warning("No tools were collected from any server.")
 
-        expected_keys = ["weather", "bnb", "ct"]
+        # Ensure all expected keys exist, even if empty
+        expected_keys = ["weather", "bnb", "ct", "mlb", "web_search", "bq_search"]
         for k in expected_keys:
             if k not in all_tools:
-                logging.info(
-                    "Tools for key '%s' were not collected. Ensuring key exists with empty list.",
-                    k,
-                )
+                logging.info("Tools for key '%s' were not collected. Ensuring key exists with empty list.", k)
                 all_tools[k] = []
         return all_tools, exit_stack
     except Exception as e:
-        logging.error(
-            "Unhandled exception in _collect_tools_stack: %s", e, exc_info=True
-        )
+        logging.error("Unhandled exception in _collect_tools_stack: %s", e, exc_info=True)
         if stack_needs_closing:
             await exit_stack.aclose()
         raise
-
 
 # --- Agent Creation ---
 async def create_agent_with_preloaded_tools(
     loaded_mcp_tools: Dict[str, Any],
 ) -> LlmAgent:
-    """
-    Creates the root LlmAgent and its sub-agents using pre-loaded MCP tools.
-
-    Args:
-        loaded_mcp_tools: A dictionary of tools, typically populated at application
-                        startup, where keys are toolset identifiers (e.g., "bnb",
-                        "weather", "ct") and values are the corresponding tools.
-
-    Returns:
-        An LlmAgent instance representing the root agent, configured with sub-agents.
-    """
     booking_tools = loaded_mcp_tools.get("bnb", [])
     weather_tools = loaded_mcp_tools.get("weather", [])
-    combined_booking_tools = list(booking_tools)
-    combined_booking_tools.extend(weather_tools)
+    combined_booking_tools = list(booking_tools) + list(weather_tools) # Ensure they are lists
     ct_tools = loaded_mcp_tools.get("ct", [])
     mlb_tools = loaded_mcp_tools.get("mlb", [])
+    web_search_tools = loaded_mcp_tools.get("web_search", [])
+    bq_search_tools = loaded_mcp_tools.get("bq_search", [])
+
+    # Tools for GameRecapAgent and its sub-agents
+    # These LlmAgents will need specific tools from the broader set.
+    game_recap_tool_list = list(mlb_tools) + list(web_search_tools) + list(bq_search_tools)
+
 
     booking_agent = LlmAgent(
         model=MODEL_ID,
         name="booking_assistant",
         instruction="""Use booking_tools to handle inquiries related to
-        booking accommodations (rooms, condos, houses, apartments, town-houses),
-        and checking weather information.
+        booking accommodations and weather information.
         Format your response using Markdown.
-        If you don't know how to help, or none of your tools are appropriate for it,
-        call the function "agent_exit" hand over the task to other sub agent.""",
+        If you don't know how to help, call "agent_exit".""",
         tools=combined_booking_tools,
     )
 
     cocktail_agent = LlmAgent(
         model=MODEL_ID,
         name="cocktail_assistant",
-        instruction="""Use ct_tools to handle all inquiries related to cocktails,
-        drink recipes, ingredients,and mixology.
+        instruction="""Use ct_tools to handle all inquiries related to cocktails.
         Format your response using Markdown.
-        If you don't know how to help, or none of your tools are appropriate for it,
-        call the function "agent_exit" hand over the task to other sub agent.""",
+        If you don't know how to help, call "agent_exit".""",
         tools=ct_tools,
     )
 
-
-        # Option 2: Create a dedicated MLB sub-agent (Recommended for clarity if it grows)
     mlb_assistant = LlmAgent(
          model=MODEL_ID,
-         name="mlb_assistant", # ADK will make tools available as mlb_assistant.tool_name
+         name="mlb_assistant",
          instruction="""You are an MLB Stats assistant.
-         Use your tools (prefixed with `mlb_stats.`) to answer questions about Major League Baseball.
-         Your capabilities include:
-         - Retrieving live game scores and status (`mlb_stats.get_live_game_score`). This requires a `game_pk`.
-         - Getting recent play-by-play summaries for a game (`mlb_stats.get_game_play_by_play_summary`). This requires a `game_pk`.
-         - Fetching a player's statistics for a specific game (`mlb_stats.get_player_stats_for_game`). This requires a `game_pk` and a `player_id`.
-         - Providing team schedules (`mlb_stats.get_team_schedule`). This requires a `team_identifier` (string: team name or team ID as a string) and optionally a `days_range`.
-         - Displaying league standings (`mlb_stats.get_league_standings`). This requires a `league_id` (103 for AL, 104 for NL) and a `season` year.
-
-         When a tool requires a `team_identifier`, you can accept common team names (e.g., "Yankees", "Red Sox", "Cubs") or their official MLB team ID. The tool will attempt to resolve the name. If a team name is ambiguous or not recognized by the tool, the tool will return an error, and you should inform the user or ask for clarification (e.g., "I couldn't find a team named 'X'. Could you spell it out or provide the team ID?").
-
-         If the user does not provide all necessary IDs (like `game_pk`, `player_id`, `team_id`, `league_id`, `season`), you MUST ask for them before calling the tool.
-         For `get_team_schedule`, if `days_range` is not specified, the tool defaults to 7 days in the future. You can ask the user if they want a different range (e.g., past games or a different future window).
-         For `get_league_standings`, if the `season` is not specified, you should ask for it, or you can attempt to use the current calendar year if appropriate for the context (e.g., asking about "current standings"). The tool itself might also try to infer the current season if not provided, but it's better to be explicit.
-         For `get_team_roster`, if `roster_type` is not clear from the user's request, you can ask if they want a specific type (like 'active' or '40-man roster') or proceed with the default.
-
+         Use your tools (e.g., `mlb.get_live_game_score`, `mlb.get_team_schedule`) to answer questions about Major League Baseball.
+         If the user does not provide all necessary IDs (like `game_pk`, `player_id`, `team_id`), you MUST ask for them before calling the tool.
+         If a user asks for a game recap, and you identify a game_pk, you should state that you can provide stats and scores, but for a full recap, they might want to ask the main assistant to route them to the recap specialist. Or, provide the game_pk and use agent_exit.
          Format your responses clearly using Markdown.
-         If you cannot help with a specific MLB-related request or lack the right tool, explain this to the user. If the request is entirely non-MLB, or you are truly stuck, use "agent_exit" to hand over the task.
+         If you cannot help, use "agent_exit".""",
+         tools=mlb_tools,
+    )
 
-         """,
-         tools=mlb_tools, # Tools will be namespaced by the MCP server name, e.g., mlb_stats.get_live_game_score
+    # --- Sub-Agents for GameRecapAgent ---
+    # Ensure `game_pk` is consistently available in session state for these agents.
+    # `user_query` or a `task_description` should also be in session state.
+    
+    # Note: Tool names used by LlmAgent instructions should match how ADK makes them available
+    # e.g., if bq_search_tools contains a tool `search_past_critiques` from server "bq_search",
+    # it might be callable as `bq_search.search_past_critiques` in the prompt.
+
+    initial_recap_generator_agent = LlmAgent(
+        name="InitialRecapGenerator",
+        model=GEMINI_PRO_MODEL_ID, # Potentially more powerful model for generation
+        instruction="""You are an expert sports journalist.
+        Your task is to generate an initial game recap.
+        Expected in session state: `game_pk` (e.g., 717527), `user_query`.
+
+        1.  Construct `task_text` for critique search: "recap for game_pk {session.state.game_pk} related to '{session.state.user_query}'".
+        2.  Fetch past critiques using `bq_search.search_past_critiques` with this `task_text` and `game_pk`. Store them in session state as `previous_critiques_content`.
+        3.  Fetch live game score using `mlb.get_live_game_score` for `game_pk`. Store as `live_score_data`.
+        4.  Fetch play-by-play summary using `mlb.get_game_play_by_play_summary` for `game_pk` (e.g., last 10 plays). Store as `pbp_summary_data`.
+            (Alternatively, for more detail if needed: `bq_search.get_filtered_play_by_play` with `game_pk`, and a simple filter like '1=1' and limit, store as `detailed_pbp_data`.)
+        5.  Synthesize all this information (`live_score_data`, `pbp_summary_data`, `previous_critiques_content`) into an engaging initial game recap.
+        6.  If `game_pk` is missing or ambiguous from the user query, your first step is to inform the user they need to specify a game clearly. Do not proceed with tool calls without a `game_pk`. If you must exit, use agent_exit.
+        Output the generated recap.
+        """,
+        tools=[
+            tool for toolset_name in ["bq_search", "mlb"] for tool in loaded_mcp_tools.get(toolset_name, [])
+        ], # Provide specific tools
+        output_key="current_recap",
+    )
+
+    recap_critic_agent = LlmAgent(
+        name="RecapCritic",
+        model=MODEL_ID,
+        instruction="""You are a sports story critic.
+        Expected in session state: `current_recap`, `game_pk`, `user_query`.
+        Review the `current_recap`. Provide 2-3 sentences of constructive criticism.
+        Focus on:
+        - Accuracy and completeness (compared to typical game events).
+        - Engagement, narrative flow, and clarity.
+        - Identify specific information gaps or areas that could be enhanced with more details (e.g., key player performances, turning points, quotes if available from web search).
+        Output only the critique.
+        """,
+        output_key="current_critique",
+    )
+
+    critique_processor_agent = LlmAgent(
+        name="CritiqueProcessor",
+        model=MODEL_ID,
+        instruction="""You are a research assistant.
+        Expected in session state: `current_critique`, `game_pk`, `user_query`.
+        Based on the `current_critique`:
+        1.  Call `bq_search.store_new_critique` to store the `current_critique`.
+            Use `task_text` = "recap for game_pk {session.state.game_pk} based on user query '{session.state.user_query}'",
+            `game_pk` = {session.state.game_pk}, and `critique_text` = {session.state.current_critique}.
+            Capture the status of this operation.
+        2.  Generate a list of 1 to 2 concise web search queries based on information gaps identified in `current_critique`.
+        3.  For each query, call `web_search.perform_web_search` (max_results=1 per query). Collect all web search result strings.
+        4.  Call `bq_search.search_rag_documents` using `current_critique` as `query_text` and `game_pk` (top_n=2). Collect all RAG document content strings.
+        5.  Output a single JSON string as your response. This JSON string should have the following keys:
+            - "critique_storage_status": (string) Status from step 1 (e.g., "Critique stored successfully with ID XYZ" or "Failed to store critique"). The result from the tool call to `bq_search.store_new_critique` (which is a JSON string itself) can be embedded here, or a summary.
+            - "web_search_findings": (list of strings) A list of content strings from the web search results. The results from `web_search.perform_web_search` are JSON strings representing lists of results; extract the relevant text for this list.
+            - "rag_findings": (list of strings) A list of content strings from the RAG document search results. The result from `bq_search.search_rag_documents` is a JSON string representing a list of contents; use that directly or extract further.
+            - "overall_status_message": (string) A brief confirmation, e.g., "Critique processed and information gathered."
+
+        Example JSON output format:
+        {{
+          "critique_storage_status": "{{\"status\": \"success\", \"critique_id\": \"xyz123\"}}",
+          "web_search_findings": ["Web finding: Player X was crucial in the 5th inning.", "Web finding: Coach Y commented on the team's spirit."],
+          "rag_findings": ["RAG: The turning point was a double play in the 7th.", "RAG: Previous summaries highlighted the pitcher's endurance."],
+          "overall_status_message": "Critique processed, web and RAG searches performed."
+        }}
+        Ensure your entire output is ONLY this JSON string. Do not add any explanatory text before or after the JSON.
+        """,
+        tools=[ # Provide specific tools
+             tool for toolset_name in ["bq_search", "web_search"] for tool in loaded_mcp_tools.get(toolset_name, [])
+        ],
+        output_key="critique_processor_results_json"
+    )
+
+    recap_reviser_agent = LlmAgent(
+        name="RecapReviser",
+        model=GEMINI_PRO_MODEL_ID,
+        instruction="""You are a sports story reviser.
+        Expected in session state:
+        - `current_recap` (the previous version of the story).
+        - `current_critique` (the critique to address).
+        - `critique_processor_results_json` (a JSON string from the previous step, which you need to parse).
+
+        Your task:
+        1. Parse the JSON string found in `session.state.critique_processor_results_json`. This JSON string contains keys like "web_search_findings" and "rag_findings".
+        2. From the parsed JSON, extract the `web_search_findings` (which should be a list of strings) and `rag_findings` (also a list of strings).
+        3. Revise the `current_recap` based on the `current_critique`.
+        4. Incorporate relevant information from the extracted `web_search_findings` and `rag_findings` to enhance the recap, making it more detailed and engaging.
+        5. Ensure the revised recap is coherent, engaging, and addresses the critique.
+        Your final output should be ONLY the revised story text. Do not include any conversational filler like "Okay, I will revise..." or any other explanatory text in your output.
+        """,
+        output_key="current_recap", # Overwrites the original story
+    )
+
+    grammar_check_agent = LlmAgent(
+        name="RecapGrammarCheck",
+        model=MODEL_ID,
+        instruction="""You are a grammar checker.
+        Expected in session state: `current_recap`.
+        Check the grammar of the `current_recap`. Output only suggested corrections as a list, or 'Grammar is good!'.""",
+        output_key="grammar_suggestions",
+    )
+
+    tone_check_agent = LlmAgent(
+        name="RecapToneCheck",
+        model=MODEL_ID,
+        instruction="""You are a tone analyzer.
+        Expected in session state: `current_recap`.
+        Analyze the tone of the `current_recap`. Output only one word: 'positive', 'negative', or 'neutral'.""",
+        output_key="tone_check_result",
+    )
+
+    game_recap_assistant = GameRecapAgent(
+        name="game_recap_assistant",
+        initial_recap_generator=initial_recap_generator_agent,
+        recap_critic=recap_critic_agent,
+        critique_processor=critique_processor_agent,
+        recap_reviser=recap_reviser_agent,
+        grammar_check=grammar_check_agent,
+        tone_check=tone_check_agent,
     )
 
     root_agent = LlmAgent(
         model=MODEL_ID,
-        name="ai_assistant",
+        name="ai_assistant", # This is the app_name for the runner sometimes
         instruction=ROOT_AGENT_INSTRUCTION,
-        sub_agents=[cocktail_agent, booking_agent, mlb_assistant],
+        sub_agents=[cocktail_agent, booking_agent, mlb_assistant, game_recap_assistant], # Added game_recap_assistant
     )
     return root_agent
-
 
 # --- Agent Execution Helpers ---
 async def _run_agent_and_get_response(

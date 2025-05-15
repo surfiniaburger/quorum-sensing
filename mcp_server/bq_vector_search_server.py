@@ -116,9 +116,10 @@ async def _insert_bq_rows_json_async(table_id: str, rows: List[Dict]) -> bool:
 # --- MCP Tools ---
 
 @mcp.tool()
-async def search_rag_documents(query_text: str, game_pk: Optional[int] = None, top_n: int = DEFAULT_RAG_TOP_N) -> str:
+async def search_rag_documents(query_text: str, game_pk_str: str = "", top_n: int = DEFAULT_RAG_TOP_N) -> str:
     """
     Performs vector search on the RAG documents table (summaries, snippets).
+    game_pk_str: The game_pk as a string. Leave empty or send "None" if not applicable.
     Returns a JSON string list of matching document contents.
     """
     if not bq_client or not emb_model:
@@ -126,21 +127,38 @@ async def search_rag_documents(query_text: str, game_pk: Optional[int] = None, t
     if not query_text:
         return json.dumps({"error": "Query text cannot be empty."})
 
-    logger.info(f"BQ_MCP: search_rag_documents - Query: '{query_text[:50]}...', GamePK: {game_pk}, TopN: {top_n}")
+    game_pk: Optional[int] = None
+    if game_pk_str and game_pk_str.lower() != "none" and game_pk_str.strip() != "":
+        try:
+            game_pk = int(game_pk_str)
+        except ValueError:
+            logger.warning(f"BQ_MCP: Invalid game_pk_str '{game_pk_str}' received. Proceeding without game_pk filter.")
+            # Return an error or proceed without game_pk
+            # return json.dumps({"error": f"Invalid game_pk_str: {game_pk_str}. Must be an integer."})
 
+
+    logger.info(f"BQ_MCP: search_rag_documents - Query: '{query_text[:50]}...', GamePK: {game_pk} (from str: '{game_pk_str}'), TopN: {top_n}")
+
+    # ... rest of your existing logic using the parsed `game_pk` variable ...
+    # Ensure the vector_search_query construction correctly handles `game_pk` being None
+
+    # Example of how you might use the parsed game_pk:
     query_embedding_list_of_list = await _get_embeddings([query_text], task_type=RAG_EMBEDDING_TASK_TYPE)
     if not query_embedding_list_of_list or not query_embedding_list_of_list[0]:
         return json.dumps({"error": "Could not generate embedding for the RAG query."})
     query_embedding_str = f"[{','.join(map(str, query_embedding_list_of_list[0]))}]"
 
-    # Fetch more candidates initially for potential filtering in BQ or Python
     initial_top_k = top_n * 5 + 10
+    
+    # Conditional game_pk filtering in the main query or post-filtering
+    # For VECTOR_SEARCH, it might be better to fetch more and filter in Python if game_pk is used.
+    # Or, if your BQ table's `game_id` column in the `base` struct is indexed, you might add a WHERE clause.
+    # The current approach in search_rag_documents filters in Python, which is fine.
 
-    # Use the query structure from the LangGraph script (accessing 'base')
     vector_search_query = f"""
     SELECT
-        base,      -- Select the entire base row as a STRUCT/OBJECT
-        distance   -- Select the distance calculated by VECTOR_SEARCH
+        base,
+        distance
     FROM
         VECTOR_SEARCH(
             TABLE `{BQ_FULL_RAG_TABLE_ID}`,
@@ -160,47 +178,30 @@ async def search_rag_documents(query_text: str, game_pk: Optional[int] = None, t
         return json.dumps({"error": "Error performing RAG document search."})
     if not rows:
         logger.info(f"No RAG document candidates found for: '{query_text[:30]}...'.")
-        return json.dumps([]) # Return empty list
+        return json.dumps([])
 
-    # Filter and extract content in Python (similar to LangGraph script)
     results_list = []
     try:
         for row_dict in rows:
-            nested_base_data = row_dict.get('base')
-            distance = row_dict.get('distance') # May need nested access like nested_base_data.get('distance') depending on exact BQ output
+            nested_base_data = row_dict.get('base') # This is the STRUCT from BQ
+            distance = row_dict.get('distance')
 
             if isinstance(nested_base_data, dict):
-                 actual_base_struct = nested_base_data.get('base') # Check for nested 'base' again
-                 if isinstance(actual_base_struct, dict):
-                     row_game_pk = actual_base_struct.get('game_id')
-                     content = actual_base_struct.get('content')
+                 # Access fields within the 'base' STRUCT
+                 row_game_pk_val = nested_base_data.get('game_id') # Assuming 'game_id' is a field in your base table
+                 content = nested_base_data.get('content')
 
-                     # Apply game_pk filter if provided
-                     if game_pk is not None:
-                         try:
-                             # Ensure comparison is between integers
-                             if int(row_game_pk) == int(game_pk):
-                                 if content: results_list.append({"content": content, "distance": distance})
-                         except (TypeError, ValueError):
-                             continue # Skip if game_pk cannot be compared
-                     elif content: # If no game_pk filter, add if content exists
-                         results_list.append({"content": content, "distance": distance})
-                 else:
-                      # Fallback if 'base' isn't doubly nested - adapt if needed
-                      row_game_pk = nested_base_data.get('game_id')
-                      content = nested_base_data.get('content')
-                      if game_pk is not None:
-                          try:
-                              if int(row_game_pk) == int(game_pk):
-                                   if content: results_list.append({"content": content, "distance": distance})
-                          except (TypeError, ValueError):
-                               continue
-                      elif content:
-                           results_list.append({"content": content, "distance": distance})
-
-            # Add more robust parsing if the structure varies
-
-        # Sort by distance and limit
+                 # Apply game_pk filter if game_pk (the parsed int) is available
+                 if game_pk is not None:
+                     try:
+                         if row_game_pk_val is not None and int(row_game_pk_val) == game_pk:
+                             if content: results_list.append({"content": content, "distance": distance})
+                     except (TypeError, ValueError) as e:
+                         logger.debug(f"Could not compare game_pk for filtering: {row_game_pk_val} vs {game_pk}. Error: {e}")
+                         continue 
+                 elif content: 
+                     results_list.append({"content": content, "distance": distance})
+            # ...
         results_list.sort(key=lambda x: x.get('distance', float('inf')))
         final_contents = [item['content'] for item in results_list[:top_n]]
 
@@ -307,32 +308,38 @@ async def get_filtered_play_by_play(game_pk: int, filter_criteria_sql: str = "1=
     return json.dumps(rows, default=str) # Use default=str for datetime/other types
 
 @mcp.tool()
-async def search_past_critiques(task_text: str, game_pk: Optional[int] = None, top_n: int = DEFAULT_CRITIQUE_TOP_N) -> str:
+async def search_past_critiques(task_text: str, game_pk_str: str = "", top_n: int = DEFAULT_CRITIQUE_TOP_N) -> str:
     """
-    Performs vector search on past critiques based on the current task text.
-    Returns a JSON string list of relevant critique texts.
+    Performs vector search on past critiques.
+    game_pk_str: The game_pk as a string. Leave empty or send "None" if not applicable.
     """
+    # Similar conversion for game_pk_str to Optional[int] game_pk
+    game_pk: Optional[int] = None
+    if game_pk_str and game_pk_str.lower() != "none" and game_pk_str.strip() != "":
+        try:
+            game_pk = int(game_pk_str)
+        except ValueError:
+            logger.warning(f"BQ_MCP: Invalid game_pk_str '{game_pk_str}' in search_past_critiques. Proceeding without game_pk filter.")
+    
+    logger.info(f"BQ_MCP: search_past_critiques - Task: '{task_text[:50]}...', GamePK: {game_pk} (from str: '{game_pk_str}'), TopN: {top_n}")
+    # ... rest of the logic using the parsed game_pk ...
     if not bq_client or not emb_model:
         return json.dumps({"error": "BigQuery or Embedding service not available."})
     if not task_text:
         return json.dumps({"error": "Task text cannot be empty for critique search."})
 
-    logger.info(f"BQ_MCP: search_past_critiques - Task: '{task_text[:50]}...', GamePK: {game_pk}, TopN: {top_n}")
-
-    # 1. Embed the task query
     task_embedding_list_of_list = await _get_embeddings([task_text], task_type=QUERY_CRITIQUE_EMBEDDING_TASK_TYPE)
     if not task_embedding_list_of_list or not task_embedding_list_of_list[0]:
         return json.dumps({"error": "Could not generate embedding for the task text."})
     task_embedding_str = f"[{','.join(map(str, task_embedding_list_of_list[0]))}]"
 
-    # 2. Perform Vector Search
     initial_top_k = top_n * 2 + 5
-    game_filter_clause = f"AND base.game_pk = {int(game_pk)}" if game_pk is not None else ""
-    # Consider filtering out critiques from the exact same task hash if needed
+    # Construct the game_filter_clause based on the *parsed* integer game_pk
+    game_filter_clause = f"AND base.game_pk = {game_pk}" if game_pk is not None else ""
 
     vector_search_query = f"""
     SELECT
-        base.critique_text, -- Access critique_text within the base struct
+        base.critique_text, 
         distance
     FROM
         VECTOR_SEARCH(
@@ -346,17 +353,15 @@ async def search_past_critiques(task_text: str, game_pk: Optional[int] = None, t
     ORDER BY distance ASC
     LIMIT {top_n}
     """
-
+    # ... (execute query and process results) ...
     logger.info(f"BQ_MCP: Executing critique vector search: {vector_search_query[:300]}...")
     rows = await _execute_bq_query_async(vector_search_query)
 
-    if rows is None:
-        return json.dumps({"error": "Error performing critique search."})
+    if rows is None: return json.dumps({"error": "Error performing critique search."})
     if not rows:
         logger.info(f"No relevant past critiques found for task: '{task_text[:30]}...'.")
-        return json.dumps([]) # Return empty list
+        return json.dumps([])
 
-    # Extract critique text (assuming 'base' struct wrapping)
     results_list = []
     try:
         for row_dict in rows:
@@ -364,9 +369,8 @@ async def search_past_critiques(task_text: str, game_pk: Optional[int] = None, t
              if isinstance(nested_base_data, dict):
                   critique_text = nested_base_data.get('critique_text')
                   if critique_text: results_list.append(critique_text)
-             elif 'critique_text' in row_dict: # Direct access fallback
+             elif 'critique_text' in row_dict: 
                   if row_dict['critique_text']: results_list.append(row_dict['critique_text'])
-
         logger.info(f"BQ_MCP: Critique search returning {len(results_list)} critiques.")
         return json.dumps(results_list)
     except Exception as e:
@@ -375,51 +379,58 @@ async def search_past_critiques(task_text: str, game_pk: Optional[int] = None, t
 
 
 @mcp.tool()
-async def store_new_critique(critique_text: str, task_text: str, game_pk: Optional[int] = None, revision_number: Optional[int] = None) -> str:
+async def store_new_critique(critique_text: str, task_text: str, game_pk_str: str = "", revision_number_str: str = "") -> str:
     """
-    Stores a new critique and its embedding into BigQuery.
-    Requires the original task_text to generate a consistent hash.
-    Returns JSON success/error message.
+    Stores a new critique. game_pk_str and revision_number_str are optional.
     """
+    game_pk: Optional[int] = None
+    if game_pk_str and game_pk_str.lower() != "none" and game_pk_str.strip() != "":
+        try:
+            game_pk = int(game_pk_str)
+        except ValueError: # Handle error or log
+            logger.warning(f"Invalid game_pk_str '{game_pk_str}' in store_new_critique.")
+
+
+    revision_number: Optional[int] = None
+    if revision_number_str and revision_number_str.lower() != "none" and revision_number_str.strip() != "":
+        try:
+            revision_number = int(revision_number_str)
+        except ValueError: # Handle error or log
+            logger.warning(f"Invalid revision_number_str '{revision_number_str}' in store_new_critique.")
+
+    logger.info(f"BQ_MCP: store_new_critique - Storing critique for task '{task_text[:50]}...', game_pk: {game_pk}, revision: {revision_number}")
+    # ... rest of your existing logic using the parsed game_pk and revision_number ...
     if not bq_client or not emb_model:
         return json.dumps({"error": "BigQuery or Embedding service not available."})
     if not critique_text or not task_text:
         return json.dumps({"error": "Critique text and task text are required."})
 
-    logger.info(f"BQ_MCP: store_new_critique - Storing critique for task '{task_text[:50]}...'")
-
-    # 1. Embed the critique
     critique_embedding_list_of_list = await _get_embeddings([critique_text], task_type=CRITIQUE_EMBEDDING_TASK_TYPE)
     if not critique_embedding_list_of_list or not critique_embedding_list_of_list[0]:
         return json.dumps({"error": "Could not generate embedding for the critique text."})
     critique_embedding = critique_embedding_list_of_list[0]
 
-    # 2. Generate task hash
     task_hash = hashlib.sha256(task_text.encode()).hexdigest()
-
-    # 3. Prepare row
     critique_id = str(uuid.uuid4())
     timestamp_now = datetime.now(UTC).isoformat()
     row_to_insert = {
         "critique_id": critique_id,
         "task_hash": task_hash,
-        "game_pk": game_pk,
-        "revision_number": revision_number,
+        "game_pk": game_pk, # Use the parsed Optional[int] value
+        "revision_number": revision_number, # Use the parsed Optional[int] value
         "critique_text": critique_text,
         "critique_embedding": critique_embedding,
         "timestamp": timestamp_now,
     }
-
-    # 4. Insert row
     success = await _insert_bq_rows_json_async(BQ_FULL_CRITIQUE_TABLE_ID, [row_to_insert])
-
     if success:
         logger.info(f"BQ_MCP: Critique {critique_id} stored successfully.")
         return json.dumps({"status": "success", "critique_id": critique_id})
     else:
         logger.error(f"BQ_MCP: Failed to store critique for task hash {task_hash}.")
         return json.dumps({"error": "Failed to store critique in BigQuery."})
-
+    
+    
 @mcp.tool()
 async def get_player_metadata_lookup() -> str:
     """
