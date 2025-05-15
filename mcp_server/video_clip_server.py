@@ -8,9 +8,10 @@ from typing import Any, Dict, Optional, List
 import asyncio
 from datetime import datetime, UTC
 
+
 from google.cloud import storage
-import google.generativeai as genai # Use the specific client for Veo
-from google.generativeai import types as genai_types
+from google import genai # Use the specific client for Veo
+from google.genai import types as genai_types 
 from google.api_core import exceptions as google_exceptions
 from mcp.server.fastmcp import FastMCP
 
@@ -55,10 +56,10 @@ except Exception as e:
 # --- MCP Tool ---
 
 @mcp.tool()
-async def generate_video_clips_from_prompts(prompts_json: str, game_pk_str: str = "unknown_game") -> str:
+async def generate_video_clips_from_prompts(prompts: str, game_pk_str: str = "unknown_game") -> str:
     """
     Generates short video clips from text prompts using Veo.
-    Expects prompts_json as a JSON string list. Returns a JSON string list of GCS URIs.
+    Expects prompts_json as a list of strings. Returns a JSON string list of GCS URIs.
     game_pk_str is used for GCS path naming.
     """
     if not genai_client:
@@ -66,18 +67,18 @@ async def generate_video_clips_from_prompts(prompts_json: str, game_pk_str: str 
     if not storage_client: # Should not happen if init succeeds, but check
         return json.dumps({"error": "GCS client not initialized."})
 
-    try:
-        prompts: List[str] = json.loads(prompts_json)
-        if not isinstance(prompts, list) or not all(isinstance(p, str) for p in prompts):
-            raise ValueError("Input must be a JSON list of strings.")
-    except (json.JSONDecodeError, ValueError) as e:
-        logger.error(f"Invalid prompts_json input: {e}")
-        return json.dumps({"error": f"Invalid input: {e}"})
+    if not isinstance(prompts, list): # Should be a list by now
+        logger.error(f"Invalid input type: 'prompts' must be a list. Received: {type(prompts)}")
+        return json.dumps({"error": f"Invalid input type: 'prompts' must be a list. Got {type(prompts).__name__}"})
 
     if not prompts:
         logger.info("No prompts provided for video generation.")
         return json.dumps([]) # Return empty list
 
+    if not all(isinstance(p, str) for p in prompts):
+        logger.error(f"Invalid input: all items in 'prompts' list must be strings. Received: {prompts}")
+        return json.dumps({"error": "Invalid input: all prompts must be strings."})
+    
     prompts_to_animate = prompts[:MAX_PROMPTS_TO_ANIMATE_PER_CALL]
     logger.info(f"VIDEO_MCP: generate_video_clips - Processing {len(prompts_to_animate)} prompts (max {MAX_PROMPTS_TO_ANIMATE_PER_CALL}) for game {game_pk_str}.")
 

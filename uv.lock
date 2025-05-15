@@ -16,6 +16,7 @@ dependencies = [
     { name = "google-adk" },
     { name = "google-cloud" },
     { name = "google-cloud-speech" },
+    { name = "google-genai" },
     { name = "google-generativeai" },
     { name = "mcp" },
     { name = "moviepy" },
@@ -32,6 +33,7 @@ requires-dist = [
     { name = "google-adk", specifier = ">=0.1.0" },
     { name = "google-cloud", specifier = ">=0.34.0" },
     { name = "google-cloud-speech", specifier = ">=2.32.0" },
+    { name = "google-genai", specifier = ">=1.11.0" },
     { name = "google-generativeai", specifier = ">=0.8.5" },
     { name = "mcp", specifier = ">=1.6.0" },
     { name = "moviepy", specifier = ">=2.1.2" },
@@ -558,7 +560,7 @@ wheels = [
 
 [[package]]
 name = "google-genai"
-version = "1.10.0"
+version = "1.15.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "anyio" },
@@ -569,9 +571,9 @@ dependencies = [
     { name = "typing-extensions" },
     { name = "websockets" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/0e/7a/224e2f70c835202042969685ee3da00a6475508d1b64f0f1e90144f96beb/google_genai-1.10.0.tar.gz", hash = "sha256:f59423e0f155dc66b7792c8a0e6724c75c72dc699d1eb7907d4d0006d4f6186f", size = 156355, upload-time = "2025-04-09T03:48:21.961Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/f4/19/da5a085ce419c33b9e6ae308005efad9bfa1b10f59f449d075bba1f16a64/google_genai-1.15.0.tar.gz", hash = "sha256:118bb26960d6343cd64f1aeb5c2b02144a36ad06716d0d1eb1fa3e0904db51f1", size = 173452, upload-time = "2025-05-13T13:55:17.73Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/ba/a0/56839a2e202d79c773edd1c1db124da8eb2a7b657267a888080b678d0369/google_genai-1.10.0-py3-none-any.whl", hash = "sha256:41b105a2fcf8a027fc45cc16694cd559b8cd1272eab7345ad58cfa2c353bf34f", size = 154705, upload-time = "2025-04-09T03:48:20.49Z" },
+    { url = "https://files.pythonhosted.org/packages/6f/e2/acc99d36fd439fb2e558c7aebd049329dbfc08a094faf17d847d393e2810/google_genai-1.15.0-py3-none-any.whl", hash = "sha256:6d7f149cc735038b680722bed495004720514c234e2a445ab2f27967955071dd", size = 171278, upload-time = "2025-05-13T13:55:16.314Z" },
 ]
 
 [[package]]
