@@ -34,7 +34,7 @@ load_dotenv()
 
 APP_NAME = "ADK_MCP_App_Updated" # Changed to avoid potential conflicts if old app is running
 MODEL_ID = "gemini-2.0-flash" # Updated to a generally available model, ensure you have access
-GEMINI_PRO_MODEL_ID = "gemini-2.0-flash" # For potentially more complex tasks like generation/revision
+GEMINI_PRO_MODEL_ID = "gemini-2.5-flash-preview-04-17" # For potentially more complex tasks like generation/revision
 
 STATIC_DIR = "static"
 
@@ -376,70 +376,117 @@ async def create_agent_with_preloaded_tools(
 
     initial_recap_generator_agent = LlmAgent(
         name="InitialRecapGenerator",
-        model=GEMINI_PRO_MODEL_ID, # Potentially more powerful model for generation
-        instruction="""You are an expert sports journalist.
-        Your task is to generate an initial game recap.
-        Expected in session state: `game_pk` (e.g., 717527), `user_query`.
+        model=GEMINI_PRO_MODEL_ID,
+        instruction="""You are an expert sports journalist tasked with generating an initial MLB game recap.
+        Session State Expectations:
+        - `game_pk` (e.g., 717527): The unique ID for the game. If missing or ambiguous from `user_query`, your first step is to inform the user to specify a game clearly. Do not proceed with tool calls for recap generation without a definite `game_pk`. If you must exit due to no `game_pk`, use agent_exit.
+        - `user_query`: The user's original request (e.g., "recap of Pirates last game").
+        - `parsed_game_pk_from_query` (Optional, if set by an earlier step): A game_pk that was parsed directly from the user's query. Prioritize this if available.
 
-        1.  Construct `task_text` for critique search: "recap for game_pk {session.state.game_pk} related to '{session.state.user_query}'".
-        2.  Fetch past critiques using `bq_search.search_past_critiques` with this `task_text` and `game_pk`. Store them in session state as `previous_critiques_content`.
-        3.  Fetch live game score using `mlb.get_live_game_score` for `game_pk`. Store as `live_score_data`.
-        4.  Fetch play-by-play summary using `mlb.get_game_play_by_play_summary` for `game_pk` (e.g., last 10 plays). Store as `pbp_summary_data`.
-            (Alternatively, for more detail if needed: `bq_search.get_filtered_play_by_play` with `game_pk`, and a simple filter like '1=1' and limit, store as `detailed_pbp_data`.)
-        5.  Synthesize all this information (`live_score_data`, `pbp_summary_data`, `previous_critiques_content`) into an engaging initial game recap.
-        6.  If `game_pk` is missing or ambiguous from the user query, your first step is to inform the user they need to specify a game clearly. Do not proceed with tool calls without a `game_pk`. If you must exit, use agent_exit.
-        Output the generated recap.
+        Your Process:
+        1.  **Game Identification (Critical):**
+            *   If `game_pk` is not in session state: Analyze `user_query`.
+            *   If the query implies a "latest" game (e.g., "Brewers last game"), use the `mlb.get_team_schedule` tool (e.g., with `days_range=-7` or a relevant range) to find the most recent *final* game for the mentioned team. Extract its `game_pk`. If multiple recent games or ambiguity, ask for clarification *before* proceeding.
+            *   Announce the game_pk you've identified (e.g., "Okay, I've identified the game: Team A vs Team B on YYYY-MM-DD, Game PK: [game_pk]."). Update `session.state.game_pk` if you found it.
+            *   If no specific game can be confidently identified, state this and request clarification from the user. Do NOT invent a game_pk.
+
+        2.  **Fetch Past Learnings (if `game_pk` is now known):**
+            *   Construct `task_text` for critique search: "recap for game_pk {session.state.game_pk} related to '{session.state.user_query}'".
+            *   Call `bq_search.search_past_critiques` with this `task_text` and the string version of `game_pk` (e.g., `game_pk_str=str(session.state.game_pk)`). Store the results in `session.state.previous_critiques_content`. This tool should return a list of relevant critique texts.
+
+        3.  **Gather Core Game Data (if `game_pk` is known):**
+            *   Call `mlb.get_live_game_score` for the `game_pk`. Store as `live_score_data`.
+            *   Call `mlb.get_game_play_by_play_summary` for the `game_pk` (e.g., last 10-15 plays). Store as `pbp_summary_data`.
+            *   (Optional: If more detail is needed for key moments based on `user_query`, consider using `bq_search.get_filtered_play_by_play` with `game_pk` and a focused SQL filter.)
+
+        4.  **Synthesize Initial Recap (if `game_pk` is known):**
+            *   Review `live_score_data`, `pbp_summary_data`.
+            *   Crucially, review `session.state.previous_critiques_content`. These are critiques from *similar past tasks*. Use them as general guidance to avoid common pitfalls and to understand what makes a good recap (e.g., if past critiques often asked for more offensive detail, try to include that if data allows). Do not assume these critiques apply *directly* to the current game's data if the data doesn't support it.
+            *   Write an engaging initial game recap. Focus on key events, the narrative of the game, and important performances based on the available data.
+            *   Acknowledge if some specific details requested by the user aren't immediately available from these initial tool calls.
+
+        Output only the generated recap text.
         """,
         tools=[
             tool for toolset_name in ["bq_search", "mlb"] for tool in loaded_mcp_tools.get(toolset_name, [])
-        ], # Provide specific tools
+        ],
         output_key="current_recap",
     )
 
     recap_critic_agent = LlmAgent(
         name="RecapCritic",
-        model=MODEL_ID,
-        instruction="""You are a sports story critic.
+        model=MODEL_ID, # Can be a faster model
+        instruction="""You are a sharp, demanding MLB analyst and broadcast producer acting as a writing critic.
         Expected in session state: `current_recap`, `game_pk`, `user_query`.
-        Review the `current_recap`. Provide 2-3 sentences of constructive criticism.
-        Focus on:
-        - Accuracy and completeness (compared to typical game events).
-        - Engagement, narrative flow, and clarity.
-        - Identify specific information gaps or areas that could be enhanced with more details (e.g., key player performances, turning points, quotes if available from web search).
-        Output only the critique.
+        Review the `current_recap`. Provide constructive, actionable criticism. Focus on:
+        - **Accuracy & Completeness:** Are scores, key player actions, and game sequence correct and sufficiently detailed based on typical game data?
+        - **Narrative & Engagement:** Does the recap tell a compelling story of the game? Is it engaging for an MLB fan, or just a dry list of events? Does it capture the tension or turning points?
+        - **Information Gaps:** Identify specific missing information that would enhance the recap (e.g., "How did the Pirates score their runs in the 3rd inning?", "What was the starting pitcher's final line?", "Was there a key defensive play not mentioned?").
+        - **Clarity & Flow:** Is the language clear, concise, and does the recap flow logically?
+        - **Data Usage:** Are stats (if any) used effectively to support the narrative?
+
+        If the draft is excellent and requires no changes (rare!), respond ONLY with "The recap is excellent."
+        Otherwise, provide **specific, bulleted feedback** with clear examples of what needs improvement. If you identify information gaps that require external knowledge, clearly state what information is missing.
         """,
         output_key="current_critique",
     )
 
     critique_processor_agent = LlmAgent(
         name="CritiqueProcessor",
-        model=MODEL_ID,
-        instruction="""You are a research assistant.
+        model=GEMINI_PRO_MODEL_ID, # Use a capable model for this multi-step reasoning
+        instruction="""You are a specialized research assistant and data coordinator.
         Expected in session state: `current_critique`, `game_pk`, `user_query`.
-        Based on the `current_critique`:
-        1.  Call `bq_search.store_new_critique` to store the `current_critique`.
-            Use `task_text` = "recap for game_pk {session.state.game_pk} based on user query '{session.state.user_query}'",
-            `game_pk` = {session.state.game_pk}, and `critique_text` = {session.state.current_critique}.
-            Capture the status of this operation.
-        2.  Generate a list of 1 to 2 concise web search queries based on information gaps identified in `current_critique`.
-        3.  For each query, call `web_search.perform_web_search` (max_results=1 per query). Collect all web search result strings.
-        4.  Call `bq_search.search_rag_documents` using `current_critique` as `query_text` and `game_pk` (top_n=2). Collect all RAG document content strings.
-        5.  Output a single JSON string as your response. This JSON string should have the following keys:
-            - "critique_storage_status": (string) Status from step 1 (e.g., "Critique stored successfully with ID XYZ" or "Failed to store critique"). The result from the tool call to `bq_search.store_new_critique` (which is a JSON string itself) can be embedded here, or a summary.
-            - "web_search_findings": (list of strings) A list of content strings from the web search results. The results from `web_search.perform_web_search` are JSON strings representing lists of results; extract the relevant text for this list.
-            - "rag_findings": (list of strings) A list of content strings from the RAG document search results. The result from `bq_search.search_rag_documents` is a JSON string representing a list of contents; use that directly or extract further.
-            - "overall_status_message": (string) A brief confirmation, e.g., "Critique processed and information gathered."
 
-        Example JSON output format:
-        {{
-          "critique_storage_status": "{{\"status\": \"success\", \"critique_id\": \"xyz123\"}}",
-          "web_search_findings": ["Web finding: Player X was crucial in the 5th inning.", "Web finding: Coach Y commented on the team's spirit."],
-          "rag_findings": ["RAG: The turning point was a double play in the 7th.", "RAG: Previous summaries highlighted the pitcher's endurance."],
-          "overall_status_message": "Critique processed, web and RAG searches performed."
-        }}
-        Ensure your entire output is ONLY this JSON string. Do not add any explanatory text before or after the JSON.
+        Your multi-step task is to process the `current_critique` and gather information for revision:
+
+        1.  **Store the Critique:**
+            *   Call the `bq_search.store_new_critique` tool.
+            *   Use parameters:
+                *   `critique_text` = {session.state.current_critique}
+                *   `task_text` = "recap for game_pk {session.state.game_pk} based on user query '{session.state.user_query}'" (ensure `game_pk` and `user_query` are from session state).
+                *   `game_pk_str` = If `session.state.game_pk` has an integer value, convert it to its string representation (e.g., if game_pk is 777930, pass "777930") and/or If `session.state.game_pk` is null/None or not present, pass an **empty string.
+                *   `revision_number_str` = string representation of {session.state.revision_number} (if available, otherwise empty string).
+            *   Let the result of this tool call be `critique_storage_status_json`.
+
+        2.  **Generate Targeted Web Search Queries from Critique:**
+            *   Carefully analyze the `current_critique`. Identify 1-3 key questions or information gaps highlighted by the critique that could be addressed with a web search (e.g., details of a specific play, player's recent performance trends, injury news before the game, context of a rivalry).
+            *   Formulate these as concise, effective search queries suitable for the Tavily search engine.
+            *   Let this list of query strings be `generated_tavily_queries`. (This is an internal thought process; you will use these queries in the next step).
+
+        3.  **Perform Web Searches:**
+            *   If you generated any `generated_tavily_queries` in step 2:
+                *   For each query in `generated_tavily_queries` (max 3 queries total):
+                    *   Call the `web_search.perform_web_search` tool with the `query` and `max_results=1` (or 2 if more context is needed).
+                *   Collect all results. Let the combined list of web search result strings be `web_search_findings_list`. If no results, this should be an empty list or a list with "No relevant web results found."
+
+        4.  **Perform RAG Document Search (Contextual Game Info):**
+            *   Call `bq_search.search_rag_documents` using:
+                *   `query_text` = {session.state.current_critique} (to find RAG docs relevant to the critique points)
+                *   `game_pk_str` = string representation of {session.state.game_pk}
+                *   `top_n` = 2.
+            *   Let the result (a JSON string list of document contents) be `rag_findings_json_list`.
+
+        5.  **Assemble Final JSON Output:**
+            *   Construct a single JSON string as your output. This JSON object must have the following keys:
+                - `"critique_storage_status"`: (string) The `critique_storage_status_json` obtained from step 1.
+                - `"web_search_queries_generated"`: (list of strings) The `generated_tavily_queries` you formulated in step 2.                
+                - `"web_search_findings"`: (list of strings) The `web_search_findings_list` from step 3.
+                - `"rag_findings"`: (list of strings) Parse `rag_findings_json_list` from step 4 into a Python list of strings.
+                - `"overall_status_message"`: (string) A brief confirmation, e.g., "Critique processed. Web and RAG searches performed based on critique."
+
+            Example JSON output format:
+            ```json
+            {{
+              "critique_storage_status": "{{\"status\": \"success\", \"critique_id\": \"xyz123\"}}",
+              "web_search_findings": ["Tavily: Player X was indeed recovering from a minor injury before the game.", "Tavily: The rivalry dates back to a controversial playoff series in 2010."],
+              "rag_findings": ["RAG: The game summary highlighted the manager's post-game comments on the team's resilience.", "RAG: Detailed play analysis shows the turning point was the 7th inning double play."],
+              "overall_status_message": "Critique processed. Web and RAG searches performed to address critique points."
+            }}
+            ```
+        Ensure your entire output is ONLY this single, valid JSON string. Do not add any explanatory text before or after the JSON.
+        If a step yields no data (e.g., no web queries generated, or searches return nothing), represent that with empty lists (e.g., `"web_search_findings": []`) in the final JSON.
         """,
-        tools=[ # Provide specific tools
+        tools=[
              tool for toolset_name in ["bq_search", "web_search"] for tool in loaded_mcp_tools.get(toolset_name, [])
         ],
         output_key="critique_processor_results_json"
@@ -448,22 +495,31 @@ async def create_agent_with_preloaded_tools(
     recap_reviser_agent = LlmAgent(
         name="RecapReviser",
         model=GEMINI_PRO_MODEL_ID,
-        instruction="""You are a sports story reviser.
-        Expected in session state:
-        - `current_recap` (the previous version of the story).
-        - `current_critique` (the critique to address).
-        - `critique_processor_results_json` (a JSON string from the previous step, which you need to parse).
+        instruction="""You are an expert sports story editor and reviser.
+        Session State Expectations:
+        - `current_recap`: The previous version of the game recap.
+        - `current_critique`: The critique to address.
+        - `critique_processor_results_json`: A JSON string from the previous step. This JSON contains:
+            - `critique_storage_status` (string)
+            - `web_search_findings` (list of strings from targeted Tavily searches based on the critique)
+            - `rag_findings` (list of strings from RAG document searches based on the critique)
+            - `overall_status_message` (string)
+        - `user_query`: The original user request.
+        - `previous_critiques_content` (Optional): General learnings from similar past tasks.
 
-        Your task:
-        1. Parse the JSON string found in `session.state.critique_processor_results_json`. This JSON string contains keys like "web_search_findings" and "rag_findings".
-        2. From the parsed JSON, extract the `web_search_findings` (which should be a list of strings) and `rag_findings` (also a list of strings).
-        3. Revise the `current_recap` based on the `current_critique`.
-        4. Incorporate relevant information from the extracted `web_search_findings` and `rag_findings` to enhance the recap, making it more detailed and engaging.
-        5. Ensure the revised recap is coherent, engaging, and addresses the critique.
-        Your final output should be ONLY the revised story text. Do not include any conversational filler like "Okay, I will revise..." or any other explanatory text in your output.
+        Your Task:
+        1.  **Parse Research:** Parse the JSON string found in `session.state.critique_processor_results_json`. Extract `web_search_findings` and `rag_findings`.
+        2.  **Address Critique with Research:** Thoroughly revise the `current_recap` to specifically address every point in the `current_critique`.
+            *   Critically, **integrate relevant information from the parsed `web_search_findings` and `rag_findings`** to fill information gaps, add context, or correct inaccuracies identified by the critique. These findings are highly relevant as they were sourced based on the *current* critique.
+        3.  **Consult Past Learnings:** Also, consider the general advice from `session.state.previous_critiques_content` if it offers relevant high-level guidance (but prioritize addressing the current critique with current research).
+        4.  **Enhance Narrative:** Improve clarity, engagement, and storytelling flow. Ensure player performances are contextualized and key moments are impactful.
+        5.  **Fulfill Original Request:** Double-check that the revised recap comprehensively addresses the `user_query`.
+
+        Your final output should be ONLY the revised and improved story text. Do not include any conversational filler like "Okay, I have revised..." or any other explanatory text.
         """,
-        output_key="current_recap", # Overwrites the original story
+        output_key="current_recap",
     )
+
 
     grammar_check_agent = LlmAgent(
         name="RecapGrammarCheck",

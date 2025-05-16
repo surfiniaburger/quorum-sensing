@@ -167,3 +167,59 @@ simple ui
 A voice-controlled video generator 
 
 
+
+
+e-packages/google/cloud/bigquery/_pandas_helpers.py", line 1144, in verify_pandas_imports
+    raise ValueError(_NO_DB_TYPES_ERROR) from db_dtypes_import_exception
+ValueError: Please install the 'db-dtypes' package to use this function.
+2025-05-16 13:38:05,778 - ERROR - bq_vector_search_mcp - BQ_MCP: search_past_critiques - _execute_bq_query_async returned None (error occurred).
+Processing request of type CallToolRequest
+MCP Tool: get_live_game_score called for game_pk=777946
+Requesting MLB API: https://statsapi.mlb.com/api/v1.1/game/777946/feed/live with params: None
+HTTP Request: GET https://statsapi.mlb.com/api/v1.1/game/777946/feed/live "HTTP/1.1 200 OK"
+Processing request of type CallToolRequest
+MCP Tool: get_game_play_by_play_summary called for game_pk=777946, count=15
+Requesting MLB API: https://statsapi.mlb.com/api/v1.1/game/777946/feed/live with params: None
+HTTP Request: GET https://statsapi.mlb.com/api/v1.1/game/777946/feed/live "HTTP/1.1 200 OK"
+2025-05-16 13:38:08,629 - INFO - main - [game_recap_assistant] Event from InitialRecapGenerator: {
+  "content": {
+    "parts": [
+      {
+        "function_response": {
+          "id": "adk-0954bd9b-55a3-4010-bc14-108aa0252453",
+          "name": "search_past_critiques",
+          "response": {
+            "result": {
+              "content": [
+                {
+                  "type": "text",
+                  "text": "{\"error\": \"BQ_MCP: Error performing critique vector search in BigQuery.\"}"
+                }
+              ],
+              "isError": false
+            }
+          }
+        }
+      },
+      {
+        "function_response": {
+          "id": "adk-32fbdf93-71fd-4ffe-80ae-f75233f2c0d0",
+          "name": "get_live_game_score",
+          "response": {
+            "result": {
+              "content": [
+                {
+                  "type": "text",
+                  "text": "Game PK: 777946\nStatus: Final\nScore: Athletics 2 - Los Angeles Dodgers 19\nCurrent Inning:  9 (Top)\nOuts: 3"
+                }
+              ],
+              "isError": false
+            }
+          }
+        }
+      },
+      {
+        "function_response": {
+          "id": "adk-251ed266-5266-481d-9e07-a68c01519fff",
+          "name": "get_game_play_by_play_summary",
+          "response": {
