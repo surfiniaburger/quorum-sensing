@@ -170,6 +170,68 @@ async def get_live_game_score(game_pk: int) -> str:
     return f"Could not retrieve live score for game_pk {game_pk}."
 
 @mcp.tool()
+async def get_game_boxscore_and_details(game_pk: int) -> str:
+    """
+    Retrieves comprehensive game details including game metadata, boxscore, and linescore
+    for a given MLB game_pk. This provides richer data for generating detailed recaps.
+    Returns a JSON string of the extracted data.
+    """
+    if not isinstance(game_pk, int):
+        try:
+            game_pk = int(game_pk)
+        except ValueError:
+            return json.dumps({"error": "Invalid game_pk provided. It must be an integer."})
+
+    logger.info(f"MCP Tool: get_game_boxscore_and_details called for game_pk={game_pk}")
+    
+    full_feed_data = await make_mlb_api_request(
+        endpoint_version="v1.1",
+        path=f"game/{game_pk}/feed/live"
+    )
+
+    if not full_feed_data:
+        return json.dumps({"error": f"Could not retrieve comprehensive data for game_pk {game_pk}."})
+
+    extracted_data = {}
+    
+    if "gameData" in full_feed_data:
+        extracted_data["game_info"] = full_feed_data["gameData"]
+    else:
+        logger.warning(f"gameData not found in feed for game_pk {game_pk}")
+        extracted_data["game_info"] = None
+
+    live_data = full_feed_data.get("liveData", {})
+    
+    if "boxscore" in live_data:
+        extracted_data["boxscore"] = live_data["boxscore"]
+    else:
+        logger.warning(f"liveData.boxscore not found in feed for game_pk {game_pk}")
+        extracted_data["boxscore"] = None
+        
+    if "linescore" in live_data:
+        extracted_data["linescore"] = live_data["linescore"]
+    else:
+        logger.warning(f"liveData.linescore not found in feed for game_pk {game_pk}")
+        extracted_data["linescore"] = None
+        
+    # Optionally, include a small, fixed number of recent plays if needed for context,
+    # but avoid allPlays to keep the payload size manageable.
+    # all_plays = live_data.get("plays", {}).get("allPlays", [])
+    # if all_plays:
+    #     extracted_data["recent_plays_sample"] = all_plays[-5:] # Last 5 plays
+    # else:
+    #     extracted_data["recent_plays_sample"] = []
+
+
+    if not extracted_data.get("game_info") and not extracted_data.get("boxscore") and not extracted_data.get("linescore"):
+        return json.dumps({"error": f"No key data sections (game_info, boxscore, linescore) found in feed for game_pk {game_pk}."})
+
+    logger.info(f"Successfully extracted game_info, boxscore, and linescore for game_pk {game_pk}.")
+    # Use default=str to handle any non-serializable types like datetime objects if they sneak in
+    return json.dumps(extracted_data, default=str)
+
+
+@mcp.tool()
 async def get_game_play_by_play_summary(game_pk: int, count: int = 3) -> str:
     """
     Retrieves a summary of the last few plays for a given MLB game_pk.
@@ -215,10 +277,8 @@ async def get_game_play_by_play_summary(game_pk: int, count: int = 3) -> str:
 # Add this function inside mcp_server/mlb_stats_server.py
 
 def format_player_game_stats(player_data: Dict[str, Any], player_id: int) -> str:
-    """Formats a player's game stats into a readable string."""
-    if not player_data:
-        return f"No data found for player ID {player_id} in this game."
-
+    # (Implementation as before)
+    if not player_data: return f"No data found for player ID {player_id} in this game."
     person_info = player_data.get("person", {})
     player_name = person_info.get("fullName", f"Player ID {player_id}")
     position = player_data.get("position", {}).get("abbreviation", "N/A")
@@ -226,120 +286,28 @@ def format_player_game_stats(player_data: Dict[str, Any], player_id: int) -> str
     batting_stats = stats.get("batting", {})
     pitching_stats = stats.get("pitching", {})
     fielding_stats = stats.get("fielding", {})
-
     summary_lines = [f"Stats for {player_name} (Position: {position}):"]
-
     if batting_stats:
-        # Common batting stats, you can add more from the API response
-        # Example: atBats, runs, hits, rbi, walks, strikeOuts, homeRuns, baseOnBalls, avg, obp, slg, ops
-        # The API often uses camelCase keys.
         b_summary = "  Batting: "
-        b_fields = {
-            "AB": batting_stats.get("atBats"), "R": batting_stats.get("runs"),
-            "H": batting_stats.get("hits"), "RBI": batting_stats.get("rbi"),
-            "BB": batting_stats.get("walks") or batting_stats.get("baseOnBalls"), # API sometimes uses 'walks', sometimes 'baseOnBalls'
-            "SO": batting_stats.get("strikeOuts"), "HR": batting_stats.get("homeRuns"),
-            "AVG": batting_stats.get("avg"), "OBP": batting_stats.get("obp"),
-            "SLG": batting_stats.get("slg"), "OPS": batting_stats.get("ops")
-        }
-        b_parts = [f"{k}: {v}" for k, v in b_fields.items() if v is not None and v != ""] # Only show if stat exists and is not empty
-        if not b_parts: # Handle cases like pitchers who didn't bat
-            b_summary += "Did not bat or no batting stats recorded."
-        else:
-            b_summary += ", ".join(b_parts)
+        b_fields = {"AB": batting_stats.get("atBats"), "R": batting_stats.get("runs"), "H": batting_stats.get("hits"), "RBI": batting_stats.get("rbi"), "BB": batting_stats.get("walks") or batting_stats.get("baseOnBalls"), "SO": batting_stats.get("strikeOuts"), "HR": batting_stats.get("homeRuns"), "AVG": batting_stats.get("avg"), "OBP": batting_stats.get("obp"), "SLG": batting_stats.get("slg"), "OPS": batting_stats.get("ops")}
+        b_parts = [f"{k}: {v}" for k, v in b_fields.items() if v is not None and v != ""]
+        b_summary += ", ".join(b_parts) if b_parts else "Did not bat or no batting stats recorded."
         summary_lines.append(b_summary)
-
     if pitching_stats:
-        # Common pitching stats
-        # Example: inningsPitched, runs, homeRuns, earnedRuns, strikeOuts, baseOnBalls, era, whips
         p_summary = "  Pitching: "
-        p_fields = {
-            "IP": pitching_stats.get("inningsPitched"), "H": pitching_stats.get("hits"),
-            "R": pitching_stats.get("runs"), "ER": pitching_stats.get("earnedRuns"),
-            "BB": pitching_stats.get("walks") or pitching_stats.get("baseOnBalls"),
-            "SO": pitching_stats.get("strikeOuts"), "HR": pitching_stats.get("homeRunsAllowed") or pitching_stats.get("homeRuns"),
-            "ERA": pitching_stats.get("era"), "WHIP": pitching_stats.get("whip"),
-            "Pitches": pitching_stats.get("pitchesThrown"), "Strikes": pitching_stats.get("strikes")
-        }
+        p_fields = {"IP": pitching_stats.get("inningsPitched"), "H": pitching_stats.get("hits"), "R": pitching_stats.get("runs"), "ER": pitching_stats.get("earnedRuns"), "BB": pitching_stats.get("walks") or pitching_stats.get("baseOnBalls"), "SO": pitching_stats.get("strikeOuts"), "HR": pitching_stats.get("homeRunsAllowed") or pitching_stats.get("homeRuns"), "ERA": pitching_stats.get("era"), "WHIP": pitching_stats.get("whip"), "Pitches": pitching_stats.get("pitchesThrown"), "Strikes": pitching_stats.get("strikes")}
         p_parts = [f"{k}: {v}" for k, v in p_fields.items() if v is not None and v != ""]
-        if not p_parts:
-             p_summary += "Did not pitch or no pitching stats recorded."
-        else:
-            p_summary += ", ".join(p_parts)
+        p_summary += ", ".join(p_parts) if p_parts else "Did not pitch or no pitching stats recorded."
         summary_lines.append(p_summary)
-
     if fielding_stats:
-        # Common fielding stats
         f_summary = "  Fielding: "
-        f_fields = {
-            "PO": fielding_stats.get("putOuts"), "A": fielding_stats.get("assists"),
-            "E": fielding_stats.get("errors"), "FPct": fielding_stats.get("fielding") # Fielding Percentage
-        }
+        f_fields = {"PO": fielding_stats.get("putOuts"), "A": fielding_stats.get("assists"), "E": fielding_stats.get("errors"), "FPct": fielding_stats.get("fielding")}
         f_parts = [f"{k}: {v}" for k, v in f_fields.items() if v is not None and v != ""]
-        if f_parts: # Only show if there are any fielding stats
-            f_summary += ", ".join(f_parts)
-            summary_lines.append(f_summary)
-
-    if len(summary_lines) == 1: # Only the header was added
-        return f"No specific batting, pitching, or fielding stats found for {player_name} in this game."
-
+        if f_parts: f_summary += ", ".join(f_parts); summary_lines.append(f_summary)
+    if len(summary_lines) == 1: return f"No specific batting, pitching, or fielding stats found for {player_name} in this game."
     return "\n".join(summary_lines)
 
-@mcp.tool()
-async def get_player_stats_for_game(game_pk: int, player_id: int) -> str:
-    """
-    Retrieves a specific player's batting, pitching, and fielding stats for a given game.
 
-    Args:
-        game_pk: The unique identifier for the MLB game.
-        player_id: The MLB official ID for the player.
-    """
-    if not isinstance(game_pk, int):
-        try: game_pk = int(game_pk)
-        except ValueError: return "Invalid game_pk. Must be an integer."
-    if not isinstance(player_id, int):
-        try: player_id = int(player_id)
-        except ValueError: return "Invalid player_id. Must be an integer."
-
-    logger.info(f"MCP Tool: get_player_stats_for_game called for game_pk={game_pk}, player_id={player_id}")
-    game_data = await make_mlb_api_request(
-        endpoint_version="v1.1",
-        path=f"game/{game_pk}/feed/live"
-    )
-
-    if not game_data:
-        return f"Could not retrieve game data for game_pk {game_pk}."
-
-    try:
-        boxscore = game_data.get("liveData", {}).get("boxscore", {})
-        teams_data = boxscore.get("teams", {})
-        player_found_data = None
-
-        # Check both home and away teams
-        for team_type in ["home", "away"]:
-            team_players = teams_data.get(team_type, {}).get("players", {}) # This is a dict with "ID{player_id}" as keys
-            player_key = f"ID{player_id}" # Player data in boxscore is keyed like "ID123456"
-            if player_key in team_players:
-                player_found_data = team_players[player_key]
-                break # Found the player
-
-        if player_found_data:
-            return format_player_game_stats(player_found_data, player_id)
-        else:
-            # Fallback: Sometimes players might be in 'batters' or 'pitchers' lists if not in main 'players' boxscore structure for some reason (less common)
-            # This part can be expanded if needed, but the 'players' dict is usually comprehensive.
-            all_person_ids_in_game = boxscore.get("home", {}).get("batters", []) + \
-                                     boxscore.get("home", {}).get("pitchers", []) + \
-                                     boxscore.get("away", {}).get("batters", []) + \
-                                     boxscore.get("away", {}).get("pitchers", [])
-            if player_id not in all_person_ids_in_game : # Check if player ID was even part of lists
-                 return f"Player ID {player_id} was not found in the boxscore for game PK {game_pk}."
-            return f"Statistics for player ID {player_id} not found in the expected boxscore structure for game PK {game_pk}. They might have played but stats are not detailed here."
-
-    except Exception as e:
-        logger.error(f"Error processing player stats for game_pk {game_pk}, player_id {player_id}: {e}", exc_info=True)
-        return f"Error processing player stats for player {player_id} in game {game_pk}."
-    
 
 # Add these imports at the top of mcp_server/mlb_stats_server.py
 from datetime import datetime, timedelta
