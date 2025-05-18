@@ -72,6 +72,19 @@ bq_vector_search_server_params = StdioServerParameters( # NEW
     command="python",
     args=["./mcp_server/bq_vector_search_server.py"],
 )
+visual_asset_server_params = StdioServerParameters( # Your existing Imagen/Cloudflare server
+    command="python",
+    args=["./mcp_server/visual_asset_server.py"], # Path to your image generation server
+)
+static_retriever_server_params = StdioServerParameters( # NEW - for headshots
+    command="python",
+    args=["./mcp_server/static_asset_retriever_mcp_server.py"],
+)
+image_embedding_server_params = StdioServerParameters( # Your existing for vector search (logos)
+    command="python",
+    args=["./mcp_server/image_embedding_server.py"],
+)
+
 
 server_configs_instance = AllServerConfigs(
     configs={
@@ -81,6 +94,9 @@ server_configs_instance = AllServerConfigs(
         "mlb": mlb_stats_server_params,
         "web_search": web_search_server_params,         # NEW
         "bq_search": bq_vector_search_server_params, # NEW
+        "visual_generator_mcp": visual_asset_server_params, # MCP for Imagen/Cloudflare generation
+        "static_retriever_mcp": static_retriever_server_params, # MCP for GCS headshot check
+        "image_embedding_mcp": image_embedding_server_params, # MCP for logo vector search
     }
 )
 
@@ -105,6 +121,218 @@ ROOT_AGENT_INSTRUCTION = """
 * **Game Recap Clarification:** If a user asks for a game recap but doesn't specify which game, ask them to specify the game (e.g., "Which game would you like a recap for? Please provide the teams and date, or the game ID if you know it.") before attempting to route to `game_recap_assistant`. If they provide details, then route.
 """
 
+
+###########################################################################################################################################################################################################
+###########################################################################################################################################################################################################
+# --- VisualAssetWorkflowAgent Definition ---
+# This agent orchestrates the entire visual asset workflow, including static asset retrieval,
+# In main.py, after LlmAgent definitions for visuals
+
+class VisualAssetWorkflowAgent(BaseAgent):
+    model_config = {"arbitrary_types_allowed": True}
+    static_asset_query_generator: LlmAgent
+    static_asset_retriever: LlmAgent
+    generated_visual_prompts_generator: LlmAgent
+    visual_generator_mcp_caller: LlmAgent
+    visual_critic: LlmAgent
+    new_visual_prompts_creator: LlmAgent
+    max_visual_refinement_loops: int
+
+    def __init__(self, name: str, static_asset_query_generator: LlmAgent, static_asset_retriever: LlmAgent,
+                 generated_visual_prompts_generator: LlmAgent, visual_generator_mcp_caller: LlmAgent,
+                 visual_critic: LlmAgent, new_visual_prompts_creator: LlmAgent,
+                 max_visual_refinement_loops: int = 1):
+        sub_agents_list_for_framework = [
+            static_asset_query_generator, static_asset_retriever,
+            generated_visual_prompts_generator, visual_generator_mcp_caller,
+            visual_critic, new_visual_prompts_creator,
+        ]
+        super().__init__(
+            name=name, static_asset_query_generator=static_asset_query_generator,
+            static_asset_retriever=static_asset_retriever,
+            generated_visual_prompts_generator=generated_visual_prompts_generator,
+            visual_generator_mcp_caller=visual_generator_mcp_caller,
+            visual_critic=visual_critic, new_visual_prompts_creator=new_visual_prompts_creator,
+            max_visual_refinement_loops=max_visual_refinement_loops,
+            sub_agents=sub_agents_list_for_framework)
+
+    def _clean_json_string_from_llm(self, raw_json_string: Optional[str], default_if_empty: str = "[]") -> str:
+        """Cleans potential markdown and extra quotes from LLM's JSON string output."""
+        if not raw_json_string:
+            return default_if_empty
+        
+        clean_string = raw_json_string.strip()
+        
+        # Remove markdown ```json ... ``` or ``` ... ```
+        if clean_string.startswith("```json"):
+            clean_string = clean_string[7:] # Remove ```json
+            if clean_string.endswith("```"):
+                clean_string = clean_string[:-3] # Remove trailing ```
+        elif clean_string.startswith("```"):
+            clean_string = clean_string[3:] # Remove ```
+            if clean_string.endswith("```"):
+                clean_string = clean_string[:-3] # Remove trailing ```
+        
+        clean_string = clean_string.strip()
+        
+        # Sometimes LLMs might add an extra layer of quotes around the JSON string itself
+        if clean_string.startswith('"') and clean_string.endswith('"') and clean_string.count('"') == 2:
+            try:
+                # Attempt to parse to see if the content within quotes is valid JSON
+                # This is tricky because the string itself IS the JSON content (e.g. "\"[]\"")
+                # For simple cases like "\"[]\"", removing outer quotes is fine.
+                # For complex escaped strings, this might break.
+                # A safer bet is to rely on the LLM prompt to output clean JSON string directly.
+                # For now, we'll assume the primary issue is markdown.
+                pass # Let's not aggressively strip quotes unless we are sure.
+            except json.JSONDecodeError:
+                pass # Not a simple quoted JSON string
+
+        return clean_string if clean_string else default_if_empty
+
+
+    @override
+    async def _run_async_impl(self, ctx: InvocationContext) -> AsyncGenerator[Event, None]:
+        logger.info(f"[{self.name}] Starting visual asset workflow.")
+        # Ensure pre-requisites from GameRecapAgent are in state
+        final_dialogue_script = ctx.session.state.get("current_recap")
+        game_pk = ctx.session.state.get("game_pk", "unknown_game")
+        if "player_lookup_dict_json" not in ctx.session.state:
+            logger.warning(f"[{self.name}] 'player_lookup_dict_json' not set by GameRecapAgent. Headshot retrieval may fail.")
+            ctx.session.state["player_lookup_dict_json"] = "{}"
+
+        if not final_dialogue_script:
+            logger.warning(f"[{self.name}] 'current_recap' is missing. Cannot generate visuals.")
+            ctx.session.state["all_visual_assets_list"] = []
+            return
+
+        # --- 1. Static Asset Retrieval ---
+        logger.info(f"[{self.name}] Running StaticAssetQueryGenerator...")
+        async for event in self.static_asset_query_generator.run_async(ctx): yield event
+        
+        logger.info(f"[{self.name}] Running StaticAssetRetriever...")
+        async for event in self.static_asset_retriever.run_async(ctx): yield event
+        
+        retrieved_static_assets_json_raw = ctx.session.state.get("retrieved_static_assets_json", "[]")
+        retrieved_static_assets_json_clean = self._clean_json_string_from_llm(retrieved_static_assets_json_raw)
+        try:
+            current_static_assets_list = json.loads(retrieved_static_assets_json_clean)
+            if not isinstance(current_static_assets_list, list): current_static_assets_list = []
+        except json.JSONDecodeError as e:
+            logger.error(f"[{self.name}] Failed to parse static assets JSON: {e}. Raw: '{retrieved_static_assets_json_raw}', Cleaned: '{retrieved_static_assets_json_clean}'")
+            current_static_assets_list = []
+        logger.info(f"[{self.name}] Retrieved {len(current_static_assets_list)} static assets.")
+
+        # --- 2. Iterative Generative Visuals Workflow ---
+        logger.info(f"[{self.name}] Running GeneratedVisualPromptsGenerator (for initial prompts)...")
+        async for event in self.generated_visual_prompts_generator.run_async(ctx): yield event
+
+        all_generated_assets_details = [] # Store dicts: {prompt_origin, image_uri, type, iteration}
+        
+        # This key will hold the JSON *string* of prompts for the current iteration
+        current_prompts_json_for_generator = self._clean_json_string_from_llm(
+            ctx.session.state.get("visual_generation_prompts_json", "[]")
+        )
+        ctx.session.state["visual_generation_prompts_json_cleaned_for_tool"] = current_prompts_json_for_generator
+
+
+        for i in range(self.max_visual_refinement_loops + 1):
+            logger.info(f"[{self.name}] Visual generation/refinement iteration {i+1}/{self.max_visual_refinement_loops + 1}")
+            
+            current_prompts_json_str_for_iter = ctx.session.state.get("visual_generation_prompts_json_cleaned_for_tool", "[]")
+            
+            try:
+                current_prompts_list_for_iter = json.loads(current_prompts_json_str_for_iter)
+                if not isinstance(current_prompts_list_for_iter, list) or not current_prompts_list_for_iter:
+                    log_msg = f"[{self.name}] No visual prompts for iteration {i+1}."
+                    if i == 0: logger.warning(log_msg + " Ending visual generation.")
+                    else: logger.info(log_msg + " Ending visual refinement.")
+                    break
+            except json.JSONDecodeError as e:
+                logger.error(f"[{self.name}] Invalid JSON for prompts in iter {i+1}. Error: {e}. JSON: '{current_prompts_json_str_for_iter}'. Stopping.")
+                break
+            
+            logger.info(f"[{self.name}] Iter {i+1}: VisualGeneratorMCPCaller using prompts: {current_prompts_json_str_for_iter}")
+            # VisualGeneratorMCPCaller LlmAgent needs 'visual_generation_prompts_json' (as string) and 'game_pk'
+            # We've put the cleaned string into 'visual_generation_prompts_json_cleaned_for_tool'
+            # The LlmAgent for VisualGeneratorMCPCaller should be instructed to use this key,
+            # or we update the original 'visual_generation_prompts_json' key with the cleaned string.
+            # Let's update the original key for simplicity of LlmAgent instruction.
+            ctx.session.state['visual_generation_prompts_json'] = current_prompts_json_str_for_iter
+
+            async for event in self.visual_generator_mcp_caller.run_async(ctx): yield event
+            
+            generated_uris_this_iter_json_raw = ctx.session.state.get("generated_visual_assets_uris_json", "[]")
+            generated_uris_this_iter_json_clean = self._clean_json_string_from_llm(generated_uris_this_iter_json_raw)
+            
+            generated_uris_this_iter = []
+            try:
+                parsed_uris = json.loads(generated_uris_this_iter_json_clean)
+                if isinstance(parsed_uris, list):
+                    generated_uris_this_iter = [uri for uri in parsed_uris if isinstance(uri, str) and uri.startswith("gs://")]
+                elif isinstance(parsed_uris, dict) and parsed_uris.get("error"): # Handle MCP tool error
+                    logger.error(f"[{self.name}] MCP Visual Generator tool returned error: {parsed_uris.get('error')}")
+            except json.JSONDecodeError as e:
+                logger.error(f"[{self.name}] Failed to parse JSON from VisualGeneratorMCPCaller: {e}. Raw: '{generated_uris_this_iter_json_raw}', Cleaned: '{generated_uris_this_iter_json_clean}'")
+
+            assets_for_critique_this_iteration = []
+            for idx, prompt_text in enumerate(current_prompts_list_for_iter):
+                asset_detail = {
+                    "prompt_origin": prompt_text,
+                    "image_uri": generated_uris_this_iter[idx] if idx < len(generated_uris_this_iter) else None,
+                    "type": "generated_image" # Generic type
+                }
+                assets_for_critique_this_iteration.append(asset_detail)
+                if asset_detail["image_uri"]:
+                    all_generated_assets_details.append({**asset_detail, "iteration": i + 1})
+            
+            ctx.session.state["assets_for_critique_json"] = json.dumps(assets_for_critique_this_iteration)
+            ctx.session.state["prompts_used_for_critique_json"] = current_prompts_json_str_for_iter
+
+
+            if i >= self.max_visual_refinement_loops:
+                logger.info(f"[{self.name}] Reached max visual refinement loops. No further critique.")
+                break
+
+            logger.info(f"[{self.name}] Iter {i+1}: Running VisualCritic...")
+            async for event in self.visual_critic.run_async(ctx): yield event
+            
+            critique_text = ctx.session.state.get("visual_critique_text", "")
+            logger.info(f"[{self.name}] Iter {i+1} Visual Critique: {critique_text[:150]}...")
+            if "sufficient" in critique_text.lower():
+                logger.info(f"[{self.name}] Visuals deemed sufficient. Ending refinement.")
+                break
+
+            logger.info(f"[{self.name}] Iter {i+1}: Running NewVisualPromptsFromCritique...")
+            async for event in self.new_visual_prompts_creator.run_async(ctx): yield event
+            
+            new_prompts_json_raw = ctx.session.state.get("new_visual_generation_prompts_json", "[]")
+            new_prompts_json_clean = self._clean_json_string_from_llm(new_prompts_json_raw)
+            ctx.session.state["visual_generation_prompts_json_cleaned_for_tool"] = new_prompts_json_clean # For next iteration
+
+            try:
+                new_prompts_list = json.loads(new_prompts_json_clean)
+                if not isinstance(new_prompts_list, list) or not new_prompts_list:
+                    logger.info(f"[{self.name}] Critique yielded no new prompts. Ending refinement.")
+                    break
+            except json.JSONDecodeError:
+                logger.error(f"[{self.name}] Invalid JSON for new prompts: '{new_prompts_json_clean}'. Ending.")
+                break
+        
+        final_generated_visuals_dict = {}
+        for asset in sorted(all_generated_assets_details, key=lambda x: x.get("iteration", 0)):
+            if asset.get("image_uri"):
+                final_generated_visuals_dict[asset["image_uri"]] = asset # Deduplicate by URI, keeping latest
+        
+        all_visual_assets_list = current_static_assets_list + list(final_generated_visuals_dict.values())
+        ctx.session.state["all_visual_assets_list"] = all_visual_assets_list
+        logger.info(f"[{self.name}] Visual asset workflow finished. Total unique assets: {len(all_visual_assets_list)}")
+
+
+
+ 
+#################################################################################################################
+#################################################################################################################
 # --- GameRecapAgent Definition (Patterned after StoryFlowAgent) ---
 
 class GameRecapAgent(BaseAgent):
@@ -124,6 +352,8 @@ class GameRecapAgent(BaseAgent):
 
     refinement_loop: LoopAgent
     post_processing_sequence: SequentialAgent
+    visual_asset_workflow: VisualAssetWorkflowAgent # The new visual agent
+
 
     def __init__(
         self,
@@ -135,13 +365,14 @@ class GameRecapAgent(BaseAgent):
         recap_reviser: LlmAgent,
         grammar_check: LlmAgent,
         tone_check: LlmAgent,
+        visual_asset_workflow: VisualAssetWorkflowAgent, # Pass it in
     ):
         # Create internal composite agents
         # The loop will run: Critic -> CritiqueProcessor -> Reviser
         refinement_loop = LoopAgent(
             name="RecapRefinementLoop",
             sub_agents=[recap_critic, critique_processor, recap_reviser],
-            max_iterations=2 # Configurable number of refinement cycles
+            max_iterations=1 # Configurable number of refinement cycles
         )
         post_processing_sequence = SequentialAgent(
             name="RecapPostProcessing",
@@ -154,6 +385,7 @@ class GameRecapAgent(BaseAgent):
             initial_recap_generator,
             refinement_loop,
             post_processing_sequence,
+            visual_asset_workflow,
         ]
 
         super().__init__(
@@ -168,103 +400,140 @@ class GameRecapAgent(BaseAgent):
             refinement_loop=refinement_loop,
             post_processing_sequence=post_processing_sequence,
             sub_agents=sub_agents_list,
+            visual_asset_workflow=visual_asset_workflow, 
         )
+
+# In main.py, within GameRecapAgent class
 
     @override
     async def _run_async_impl(
         self, ctx: InvocationContext
     ) -> AsyncGenerator[Event, None]:
-        logger.info(f"[{self.name}] Starting game recap workflow.")
+        logger.info(f"[{self.name}] Starting full game recap and visual workflow.")
 
-        # Correctly get user_query:
-        # 1. Try to get it from session state (if set by a preceding agent or handler)
-        # 2. If not in state, get it from ctx.user_content (the initial message for this invocation)
-        # Get user_query PRIMARILY from session state, as it should have been parsed and placed there by the entry handlers
+        # --- 0. Pre-requisites (user_query, game_pk, player_lookup_dict_json) ---
         user_query = ctx.session.state.get("user_query")
-
         if not user_query:
-            # Fallback only if not set by entry handlers (e.g. direct test of GameRecapAgent)
-            logger.warning(f"[{self.name}] 'user_query' not found in session state. Attempting to use ctx.user_content.")
             if ctx.user_content and ctx.user_content.parts and ctx.user_content.parts[0].text:
-                raw_text_from_content = ctx.user_content.parts[0].text
-                # Check if raw_text_from_content is a JSON string like {"message":"..."}
+                # Simplistic assumption: user_content.parts[0].text is the query
+                # Robust parsing might be needed if user_content is structured JSON
                 try:
-                    data = json.loads(raw_text_from_content)
+                    data = json.loads(ctx.user_content.parts[0].text)
                     if isinstance(data, dict) and "message" in data:
                         user_query = data["message"]
-                        logger.info(f"[{self.name}] Parsed user_query from ctx.user_content (JSON): '{user_query}'")
                     else:
-                        user_query = raw_text_from_content # Assume it's plain text
-                        logger.info(f"[{self.name}] Used user_query directly from ctx.user_content (plain text): '{user_query}'")
+                        user_query = ctx.user_content.parts[0].text
                 except json.JSONDecodeError:
-                    user_query = raw_text_from_content # Not JSON, use as is
-                    logger.info(f"[{self.name}] Used user_query directly from ctx.user_content (not JSON): '{user_query}'")
-                
-                # Store it back into session state if derived here
-                if user_query:
-                    ctx.session.state["user_query"] = user_query
+                    user_query = ctx.user_content.parts[0].text
+                ctx.session.state["user_query"] = user_query
             else:
-                user_query = "generic recap request" # Fallback
-                logger.warning(f"[{self.name}] user_query also not in ctx.user_content. Using fallback: '{user_query}'")
-        else:
-            logger.info(f"[{self.name}] Found user_query in session state: '{user_query}'")
-        
-        # Ensure user_query is definitely in state for sub-agents if it was just derived
-        if "user_query" not in ctx.session.state and user_query != "generic recap request":
-             ctx.session.state["user_query"] = user_query
+                user_query = "generic recap request"
+                ctx.session.state["user_query"] = user_query
+            logger.info(f"[{self.name}] User query set to: '{user_query}'")
+
+        # Ensure game_pk is in state (InitialRecapGenerator might set this if not present)
         if "game_pk" not in ctx.session.state:
-            logger.warning(f"[{self.name}] game_pk not found in session state. InitialRecapGenerator needs to handle this or an error may occur. Current user_query for context: '{user_query}'")
-            # If user_query was just fetched from ctx.user_content and game_pk extraction is desired here:
-            # (This is a simplified example; robust extraction is complex)
-            if user_query: # Ensure user_query is available
-                text_query_lower = user_query.lower()
-                if "game pk" in text_query_lower:
-                    try:
-                        pk_str = text_query_lower.split("game pk")[-1].strip().split(" ")[0]
-                        ctx.session.state["game_pk"] = pk_str # Save to session state
-                        logger.info(f"[{self.name}] Extracted game_pk: {pk_str} from user_query and saved to session state.")
-                    except Exception as e:
-                        logger.info(f"[{self.name}] Could not parse game_pk from '{text_query_lower}': {e}")
-                elif "brewers last game" in text_query_lower: # Example for your query
-                    # This is where you'd need a tool call to figure out the "brewers last game" game_pk
-                    # For now, logging it or setting a placeholder if this agent should handle it:
-                    logger.info(f"[{self.name}] User asked for 'brewers last game', game_pk needs resolution.")
-                    # ctx.session.state["game_pk"] = "NEEDS_RESOLUTION_FOR_BREWERS_LAST_GAME"
+            logger.warning(f"[{self.name}] game_pk not in session state before InitialRecapGenerator. It will attempt to derive it.")
+        
+        # Ensure player_lookup_dict_json for VisualAssetWorkflowAgent
+        if "player_lookup_dict_json" not in ctx.session.state:
+            logger.info(f"[{self.name}] 'player_lookup_dict_json' not in state. Attempting to derive from 'player_id_to_name_map' (if set by mlb_assistant).")
+            player_id_map = ctx.session.state.get("player_id_to_name_map")
+            if player_id_map and isinstance(player_id_map, dict):
+                ctx.session.state["player_lookup_dict_json"] = json.dumps(player_id_map)
+                logger.info(f"[{self.name}] Populated 'player_lookup_dict_json' from 'player_id_to_name_map'.")
+            else:
+                logger.warning(f"[{self.name}] Could not populate 'player_lookup_dict_json'. Using empty default. Headshot retrieval might be limited.")
+                ctx.session.state["player_lookup_dict_json"] = "{}"
 
 
-        logger.info(f"[{self.name}] Running InitialRecapGenerator with game_pk: {ctx.session.state.get('game_pk')}, user_query: {ctx.session.state.get('user_query')}")
+        # --- 1. Dialogue Generation & Refinement ---
+        logger.info(f"[{self.name}] Running InitialRecapGenerator (Dialogue)...")
+        # This LlmAgent will yield its own events, including the final ModelContentEvent with the initial recap
         async for event in self.initial_recap_generator.run_async(ctx):
-            logger.info(f"[{self.name}] Event from InitialRecapGenerator: {event.model_dump_json(indent=2, exclude_none=True)}")
+            yield event # Pass these events up
+        
+        dialogue_after_initial_gen = ctx.session.state.get("current_recap", "")
+        # Check for agent_exit or game not final conditions often set by InitialRecapGenerator
+        if not dialogue_after_initial_gen or \
+           "game is not final" in dialogue_after_initial_gen.lower() or \
+           "agent_exit" in dialogue_after_initial_gen.lower() or \
+           ctx.session.state.get("agent_should_exit_flag", False): # A more explicit flag
+            logger.warning(f"[{self.name}] Initial recap indicates game not final, agent exit, or failure. Recap: '{dialogue_after_initial_gen}'. Current state: {ctx.session.state}")
+            # The last event yielded by initial_recap_generator (if it contained text) would be the final response.
+            # If it was just an agent_exit tool call, no text might have been yielded.
+            # Ensure *something* is yielded as the final response for this turn.
+            if not dialogue_after_initial_gen and not ctx.session.state.get("agent_should_exit_flag", False) : # If it's truly empty and not an exit
+                 dialogue_after_initial_gen = "Could not generate initial recap due to game status or other issue."
+                 ctx.session.state["current_recap"] = dialogue_after_initial_gen # Update state for final yield
+                 # Yield a constructed event IF the sub-agent didn't yield a final textual one
+                 yield Event(
+                     author=self.name, # This agent is deciding the final output
+                     content=types.Content(role="model", parts=[types.Part(text=dialogue_after_initial_gen)]),
+                     invocation_context=ctx # ADK needs invocation_context to build full event
+                 )
+            # If initial_recap_generator already yielded its text, that's fine, the runner takes the last model content.
+            return # Exit the GameRecapAgent's flow
+
+        logger.info(f"[{self.name}] Running Dialogue RefinementLoop (self.refinement_loop)...")
+        async for event in self.refinement_loop.run_async(ctx): # Dialogue refinement loop
             yield event
         
-        # 2. Refinement Loop (Critic -> CritiqueProcessor -> Reviser)
-        logger.info(f"[{self.name}] Running RecapRefinementLoop...")
-        async for event in self.refinement_loop.run_async(ctx):
-            logger.info(f"[{self.name}] Event from RecapRefinementLoop: {event.model_dump_json(indent=2, exclude_none=True)}")
-            yield event
-        
-        logger.info(f"[{self.name}] Recap state after loop: {ctx.session.state.get('current_recap')[:100]}...")
-
-        # 3. Sequential Post-Processing (Grammar and Tone Check)
-        logger.info(f"[{self.name}] Running RecapPostProcessing...")
-        async for event in self.post_processing_sequence.run_async(ctx):
-            logger.info(f"[{self.name}] Event from RecapPostProcessing: {event.model_dump_json(indent=2, exclude_none=True)}")
+        logger.info(f"[{self.name}] Running Dialogue PostProcessing Sequence (self.post_processing_sequence)...")
+        async for event in self.post_processing_sequence.run_async(ctx): # Dialogue post-processing
             yield event
 
-        # 4. Final Output
-        final_recap = ctx.session.state.get("current_recap", "No recap was finalized.")
-        grammar_sugg = ctx.session.state.get("grammar_suggestions", "")
-        tone_result = ctx.session.state.get("tone_check_result", "")
+        final_dialogue_recap = ctx.session.state.get("current_recap", "")
+        if not final_dialogue_recap:
+            logger.error(f"[{self.name}] Dialogue recap is empty after refinement. Aborting.")
+            yield Event( # Construct and yield an event
+                author=self.name,
+                content=types.Content(role="model", parts=[types.Part(text="Failed to produce dialogue recap after refinement.")]) ,
+                invocation_context=ctx
+            )
+            return
+        logger.info(f"[{self.name}] Dialogue workflow finished. Final dialogue (first 100 chars): {final_dialogue_recap[:100]}...")
 
-        logger.info(f"[{self.name}] Workflow finished. Final Recap: {final_recap[:100]}..., Grammar: {grammar_sugg}, Tone: {tone_result}")
+        # --- 2. Visual Asset Workflow ---
+        logger.info(f"[{self.name}] Running VisualAssetWorkflow (self.visual_asset_workflow)...")
+        # The VisualAssetWorkflowAgent itself doesn't produce a direct textual output for the user;
+        # it populates session state with 'all_visual_assets_list'.
+        # We still need to yield its internal events for logging and tracing.
+        async for event in self.visual_asset_workflow.run_async(ctx):
+            yield event
         
-        # The last agent in the sequence or loop should ideally yield the final response.
-        # If not, we can construct and yield one here.
-        # However, ADK typically expects the final agent in a chain to produce the final output event.
-        # We assume current_recap is the main output. The LlmAgent 'reviser' or 'tone_check'
-        # if it's the last one modifying content, should output it correctly.
-        # If the final response is not automatically yielded by the last sub-agent, uncomment below:
-        # yield self.create_final_response_event(ctx, final_recap)
+        all_visual_assets = ctx.session.state.get("all_visual_assets_list", [])
+        logger.info(f"[{self.name}] VisualAssetWorkflow finished. Found/generated {len(all_visual_assets)} visual assets (available in session state).")
+
+        # --- 3. Final Output Event for GameRecapAgent ---
+        # The main textual output for this GameRecapAgent is the final_dialogue_recap.
+        # The visual assets are in the session state for the application to use.
+        # We need to ensure that an Event with final_dialogue_recap is the last *ModelContentEvent* yielded
+        # if we want that to be the primary textual response picked up by the runner.
+        
+        # The self.post_processing_sequence (ending with tone_check_agent) would have been the last
+        # agent to yield a ModelContentEvent. If tone_check_agent's output ("positive", "negative")
+        # is not what we want as the final text to the user, we must explicitly yield the dialogue here.
+
+        logger.info(f"[{self.name}] Yielding final dialogue recap as the main textual output.")
+        final_event_for_dialogue = Event(
+            author=self.name, # This GameRecapAgent is the author of this final consolidated textual output
+            content=types.Content(role="model", parts=[types.Part(text=final_dialogue_recap)]),
+            # ADK framework will fill in other Event fields like id, timestamp, invocation_id (from ctx)
+            # when it processes this yielded event through session_service.append_event
+            invocation_context=ctx # Pass context for the framework to build the full event
+        )
+        yield final_event_for_dialogue
+
+        logger.info(f"[{self.name}] === GameRecapAgent processing complete. Yielded final dialogue. Visuals in state. ===")
+############################################################################################################################################
+############################################################################################################################################
+
+
+
+
+
+
 
 
 # --- Tool Collection ---
@@ -317,6 +586,7 @@ async def _collect_tools_stack(
         if stack_needs_closing:
             await exit_stack.aclose()
         raise
+
 
 # --- Agent Creation ---
 async def create_agent_with_preloaded_tools(
@@ -378,7 +648,7 @@ async def create_agent_with_preloaded_tools(
         name="InitialRecapGenerator",
         model=GEMINI_PRO_MODEL_ID,
         instruction="""
-You are an expert sports journalist tasked with generating an initial MLB game recap. Your goal is to create a compelling narrative of the game, not just a list of events.
+You are an expert sports journalist tasked with generating an initial MLB game recap in a **two-host dialogue script format**. Your goal is to create a compelling narrative of the game, not just a list of events,  presented as a conversation.
 
 Session State Expectations:
 - `game_pk` (e.g., 717527): The unique ID for the game.
@@ -402,20 +672,23 @@ Your Multi-Step Process:
     *   Parse the data: game status, final score, winning/losing pitchers, key offensive performers (multi-hit, RBIs, HRs), inning-by-inning scores.
     *   **If Game Status is "Scheduled" or not "Final"**: Your output MUST state that a full recap is not yet available as the game is not final. Then use `agent_exit`.
 
-3.  **Synthesize Initial Narrative Recap (Only if Game is "Final"):**
-    *   **Storytelling First:** Your primary goal is to tell the story of the game.
+3.  **Synthesize Initial Dialogue Script (Only if Game is "Final"):**
+    *   **Dialogue Format:**
+        *   The entire output MUST be a conversation between two hosts (e.g., Host A, Host B).
+        *   **Strict Alternation:** Each line of the script MUST represent one host speaking, alternating strictly.
+        *   **NO Speaker Labels:** CRITICAL: Do NOT include speaker labels like "Host 1:", "Host 2:", or any character names. Just write the raw dialogue line for each speaker's turn.
+    *   **Storytelling First:** Your primary goal is to tell the story of the game through this dialogue.
         *   Identify a potential "story of the game" (e.g., a pitcher's duel, an offensive breakout, a key player's heroics, a specific turning point).
-        *   Start with an engaging lead paragraph that summarizes the game's outcome and main storyline.
-    *   **Pitching Narrative:** Describe the performance of the starting pitchers, especially the winner and loser. Go beyond stats – how did they look? Were they dominant, struggling, etc.?
+        *   The dialogue should start with an engaging lead, perhaps one host setting the scene and the other reacting or adding initial thoughts, summarizing the game's outcome and main storyline.
+    *   **Pitching Narrative:** The hosts should discuss the performance of the starting pitchers, especially the winner and loser.
     *   **Offensive Highlights & Progression:**
-        *   Describe how the scoring unfolded inning by inning, focusing on the most impactful plays (key hits, home runs, RBI moments).
-        *   Name the players involved in these key offensive moments.
-        *   Weave in details from `pbp_summary_data` for crucial moments to add color.
+        *   The dialogue should cover how the scoring unfolded, focusing on the most impactful plays.
+        *   Hosts should name the players involved in these key offensive moments and discuss their contributions.
     *   **Integrate Context:**
-        *   If `pre_game_context_notes` are available, subtly weave them into the narrative where relevant (e.g., "The rivalry continued as...", "Coming into the series, Player X was on a hot streak and proved it by...").
-    *   **Guidance from Past Critiques:** Use `past_critiques_feedback` (if available) for general guidance on narrative structure, tone, and journalistic style.
-    *   **Language:** Use vivid, active language. Avoid just listing stats.
-    *   **Acknowledge Limitations:** If specific details are unavailable from the provided data (e.g., a very niche stat), do not invent them.
+        *   If `pre_game_context_notes` are available, one host might bring it up, and the other can elaborate or connect it to game events.
+    *   **Guidance from Past Critiques:** Use `past_critiques_feedback` (if available) for general guidance on narrative structure, tone, and conversational style.
+    *   **Language:** Use vivid, active language. The dialogue should sound natural and engaging. Avoid one host just listing stats for the other to react to; make it a genuine discussion.
+    *   **Acknowledge Limitations:** If specific details are unavailable, one host might pose it as a question the other can't fully answer, or they might acknowledge the gap.
 
 Output ONLY the generated recap text. Do not add conversational fluff like "Here is the recap..." or "I have gathered the data...".
         """,
@@ -431,33 +704,32 @@ Output ONLY the generated recap text. Do not add conversational fluff like "Here
         model=MODEL_ID, # Can be a faster model
         instruction="""
 You are a sharp, demanding MLB analyst and broadcast producer acting as a writing critic.
-Expected in session state: `current_recap`, `game_pk`, `user_query`.
+Expected in session state: `current_recap` (which is a two-host dialogue script), `game_pk`, `user_query`.
 
-Review the `current_recap`. Provide constructive, actionable criticism. Focus on:
+Review the `current_recap` dialogue script. Provide constructive, actionable criticism. Focus on:
 
-- **Accuracy & Completeness:**
-    - Are scores, key player actions (pitchers, hitters), and game sequence correct and sufficiently detailed?
-    - Are there any factual errors or significant omissions based on typical game data expectations?
-- **Narrative & Engagement:**
-    - Does the recap tell a compelling story of the game, or is it just a dry list of events?
-    - Does it have a clear narrative arc (beginning, rising action, climax/key moments, resolution)?
-    - Does it capture the tension, excitement, or any specific "story" of the game (e.g., a pitcher's duel, an offensive explosion, a key turning point)?
-    - Is the language engaging, vivid, and journalistic? Or is it flat and robotic?
-- **Journalistic Style:**
-    - Does it sound like a professional sports recap a fan would read on a sports website?
-    - Are there clichés or awkward phrasings that should be improved?
-    - Is there a good balance between stats and narrative description?
-- **Information Gaps & Opportunities for Enrichment:**
-    - Identify specific missing information that would enhance the story or context (e.g., "How did Player X get on base before scoring?", "What was the specific hit that drove in the go-ahead run in the 7th?", "Was there a critical defensive play not mentioned?", "What was the impact of this win/loss on standings or morale, if discernible?").
-    - Are there opportunities to better integrate existing stats or add highly relevant ones to support the narrative?
-- **Clarity & Flow:**
-    - Is the language clear, concise, and does the recap flow logically from one point to the next?
-    - Are there run-on sentences or overly complex paragraphs?
-- **Data Usage:**
-    - Are stats (if any) used effectively to support the narrative, or do they feel tacked on?
+- **Dialogue Flow & Engagement:**
+    - Does the conversation between the hosts sound natural? Is the back-and-forth engaging?
+    - Do the hosts have distinct enough 'voices' or perspectives, or do they sound too similar?
+    - Is it a real discussion, or does one host merely set up the other?
+- **Accuracy & Completeness (within the dialogue):**
+    - Are scores, key player actions, and game sequence correctly and sufficiently detailed *as discussed by the hosts*?
+- **Narrative & Engagement (of the dialogue itself):**
+    - Does the *conversation* tell a compelling story? Does it have a clear narrative arc?
+    - Does the dialogue capture tension, excitement, or the "story" of the game?
+    - Is the language used by the hosts engaging, vivid, and journalistic?
+- **Journalistic Style (of the dialogue):**
+    - Does the dialogue sound like a professional sports podcast or broadcast segment?
+- **Information Gaps & Opportunities for Enrichment (within the dialogue):**
+    - What key information are the hosts *not* discussing that would enhance the story?
+    - Are there opportunities for one host to introduce more stats or context for the other to react to?
+- **Clarity & Flow (of the dialogue):**
+    - Is the conversation easy to follow? Are the hosts' lines clear and concise?
+- **Data Usage (by the hosts):**
+    - Are stats used effectively by the hosts to support their points, or just dropped in?
 
-If the draft is excellent and requires no changes (rare!), respond ONLY with "The recap is excellent."
-Otherwise, provide **specific, bulleted feedback** with clear examples of what needs improvement or what specific information is missing that could be researched.
+If the dialogue script is excellent and requires no changes (rare!), respond ONLY with "The recap is excellent."
+Otherwise, provide **specific, bulleted feedback** with clear examples of what needs improvement in the dialogue or what specific information the hosts should discuss.
         """,
         output_key="current_critique",
     )
@@ -528,7 +800,7 @@ Otherwise, provide **specific, bulleted feedback** with clear examples of what n
         name="RecapReviser",
         model=GEMINI_PRO_MODEL_ID,
         instruction="""
-You are an expert sports story editor and reviser, tasked with transforming a game recap into a polished, engaging piece of sports journalism.
+You are an expert sports story editor and reviser, tasked with transforming a game recap **dialogue script** into a polished, engaging piece of sports journalism, maintaining the two-host conversational format.
 
 Session State Expectations:
 - `current_recap`: The existing version of the game recap.
@@ -543,18 +815,23 @@ Session State Expectations:
 
 Your Task:
 1.  **Parse Research:** Parse the JSON string in `session.state.critique_processor_results_json`. Extract `web_search_findings` and `rag_findings`.
-2.  **Address Critique Holistically:** Thoroughly revise the `current_recap` to address *every actionable point* in `current_critique`.
-    *   **Integrate Research Narratively:** Seamlessly weave in relevant information from `web_search_findings` and `rag_findings` to fill information gaps, add depth, provide context, or correct inaccuracies. Don't just append facts; integrate them into the story. If these findings are sparse or don't fully address a critique point, use the core game data (`live_score_data`, `pbp_summary_data`, `comprehensive_data_json`) to find the necessary details.
-    *   **Enhance Storytelling:** Elevate the language. Use stronger action verbs, more descriptive adjectives, and craft sentences that build excitement or highlight the significance of events.
-    *   **Refine Narrative Arc:** Ensure the recap has a clear lead, develops the game's key moments and turning points, and concludes effectively.
-    *   **Contextualize Performances:** Go beyond just stating stats. Explain their significance in the context of the game.
-3.  **Apply Stylistic Guidance:**
-    *   Incorporate general stylistic advice from `session.state.past_critiques_feedback` where applicable, but prioritize addressing the `current_critique` and its associated research.
-    *   Ensure the tone is appropriate for the game's outcome and the user's request.
-4.  **Fulfill Original Request:** Double-check that the revised recap comprehensively and engagingly addresses the `user_query`.
-5.  **Clarity and Conciseness:** Ensure the final recap is clear, flows well, and avoids unnecessary jargon or overly complex sentences.
+2.  **Address Critique Holistically (Maintaining Dialogue Format):**
+    *   Thoroughly revise the `current_recap` (which is a dialogue script) to address *every actionable point* in `current_critique`.
+    *   **Integrate Research Narratively:** Seamlessly weave in relevant information from `web_search_findings` and `rag_findings` into the *dialogue*. For example, one host might present a new finding, and the other can react or build upon it.
+    *   **Enhance Storytelling & Dialogue Flow:** Elevate the language within the hosts' lines. Ensure the back-and-forth is natural and engaging.
+    *   **Refine Narrative Arc:** Ensure the dialogue has a clear lead, develops the game's key moments and turning points through the hosts' discussion, and concludes effectively.
+    *   **Contextualize Performances:** The hosts should discuss stats and their significance within the conversation.
+3.  **Apply Stylistic Guidance (for Dialogue):**
+    *   Incorporate general stylistic advice from `session.state.past_critiques_feedback` applicable to conversational sports commentary.
+    *   Ensure the tone of the dialogue is appropriate.
+4.  **Fulfill Original Request:** Double-check that the revised dialogue script comprehensively and engagingly addresses the `user_query`.
+5.  **Clarity and Conciseness within Dialogue:** Ensure each host's lines are clear and the overall conversation flows well.
+6.  **Maintain Dialogue Format:**
+    *   The entire revised output MUST remain a conversation between two hosts.
+    *   **Strict Alternation:** Each line of the script MUST represent one host speaking, alternating strictly.
+    *   **NO Speaker Labels:** CRITICAL: Do NOT include speaker labels like "Host 1:", "Host 2:".
 
-Your final output MUST BE ONLY the revised and improved game recap text. Do not include any conversational intros, outros, or explanations about the changes you made.
+Your final output MUST BE ONLY the revised and improved game dialogue script text, with each speaker's line on a new line. Do not include any conversational intros, outros, or explanations about the changes you made.
         """,
         output_key="current_recap",
     )
@@ -595,6 +872,178 @@ Output ONLY one word that best describes the overall tone: 'positive', 'negative
         output_key="tone_check_result",
     )
 
+# --- Sub-Agents for VisualAssetWorkflowAgent ---
+
+# In main.py, within create_agent_with_preloaded_tools function
+
+# --- Sub-Agents for VisualAssetWorkflowAgent ---
+
+    static_asset_query_generator_agent = LlmAgent(
+    name="StaticAssetQueryGenerator",
+    model=MODEL_ID,
+    instruction="""
+You are an asset planner. The final dialogue script for an MLB game recap is in session state key 'current_recap'.
+Analyze this script to identify all specific MLB teams (e.g., "Los Angeles Angels", "Boston Red Sox") and player full names mentioned.
+For each full team name, generate a query string: "[Full Team Name] logo".
+For each player full name, generate: "[Player Full Name] headshot".
+Output ONLY a JSON list of these search query strings. If no relevant entities, output an empty list [].
+
+Example dialogue script: "Host A: The Los Angeles Angels really showed up today! Host B: Absolutely, and Willy Adames was key with that double for the Brewers."
+Example JSON Output:
+["Los Angeles Angels logo", "Willy Adames headshot", "Milwaukee Brewers logo"]
+    """,
+    output_key="static_asset_search_queries_json",
+)
+
+    static_asset_retriever_agent = LlmAgent(
+    name="StaticAssetRetriever",
+    model=GEMINI_PRO_MODEL_ID, # Needs to be good at instruction following and JSON manipulation
+    instruction="""
+You are an asset retrieval coordinator.
+Expected in session state:
+- 'static_asset_search_queries_json': A JSON string list of queries (e.g., '["Los Angeles Angels logo", "Willy Adames headshot"]').
+- 'player_lookup_dict_json': A JSON string of a dictionary mapping player IDs to full names (e.g., '{"12345": "Willy Adames", ...}').
+
+Your task is to process each query from 'static_asset_search_queries_json':
+1.  Parse 'player_lookup_dict_json' into a Python dictionary (player_id: player_name). Create an inverse mapping (player_name_lower_case: player_id) for efficient lookup.
+2.  Initialize an empty list called `found_assets_list`.
+3.  For each `original_query_string` in the parsed list from 'static_asset_search_queries_json':
+    a.  If the `original_query_string` contains "logo" (e.g., "Los Angeles Angels logo"):
+        i.  Carefully extract the full team name (e.g., "Los Angeles Angels"). This might involve removing " logo" and trimming whitespace.
+        ii. Call the `image_embedding_mcp.search_similar_images_by_text` tool with:
+            - `query_text` = the extracted full team name.
+            - `top_k` = 1.
+            - `filter_image_type` = "logo".
+        iii.The tool returns a JSON string representing a list of results. Parse this JSON string. If results are present, take the first result dictionary.
+        iv. If a valid logo asset dictionary is retrieved, add `{"search_term_origin": original_query_string, **logo_asset_dict}` to `found_assets_list`. (Ensure the final dict has image_uri, type, entity_name, etc.)
+    b.  If the `original_query_string` contains "headshot" (e.g., "Willy Adames headshot"):
+        i.  Extract the player's full name (e.g., "Willy Adames").
+        ii. Convert the extracted name to lowercase. Look up this lowercase name in your inverted player lookup map to get the `player_id`.
+        iii.If a `player_id` is found:
+            1. Retrieve the original casing player name using the `player_id` from the initial `player_lookup_dict`.
+            2. Call the `static_retriever_mcp.get_headshot_uri_if_exists` tool with:
+                - `player_id_str` = the found `player_id` (as a string).
+                - `player_name_for_log` = the original casing player name.
+        iv. The tool returns a JSON string. Parse it. If `image_uri` is present in the parsed dictionary, add `{"search_term_origin": original_query_string, **headshot_asset_dict}` to `found_assets_list`.
+    c.  If a query is unrecognized, skip it.
+4.  After processing all queries, convert `found_assets_list` into a JSON string. This is your final output.
+    If 'static_asset_search_queries_json' was initially empty or no assets were successfully found and added to `found_assets_list`, output an empty JSON list string: "[]".
+    """,
+    tools=[
+        *loaded_mcp_tools_global.get("static_retriever_mcp", []),
+        *loaded_mcp_tools_global.get("image_embedding_mcp", [])
+    ],
+    output_key="retrieved_static_assets_json",
+)
+
+    generated_visual_prompts_agent = LlmAgent(
+    name="GeneratedVisualPrompts",
+    model=GEMINI_PRO_MODEL_ID,
+    instruction="""
+You are an assistant director analyzing an MLB game dialogue script (in session state 'current_recap') to plan visual shots for an image generation model like Imagen 3 (which filters specific names).
+Identify 3-5 key moments, scenes, or actions described in the dialogue that need a generated visual.
+
+**Critical Imagen Compatibility Rules:**
+1.  **NO Player Names:** Use generic descriptions ("an MLB player", "the batter", "the pitcher", "a fielder", "the runner").
+2.  **NO Team Names.**
+3.  **Uniforms:** Describe generically based on home/away context if implied by the dialogue ("a player in a white home uniform", "the batter in a home jersey", "a player in a colored away uniform", "the pitcher in a gray away jersey"), or neutrally ("an MLB player's uniform"). If specific colors are mentioned in the dialogue for a generic player (e.g. "the batter in blue and orange"), use those.
+
+**Prompt Generation Guidelines:**
+*   For actions (home run, double play, strikeout), generate 1-2 distinct visual prompts representing the sequence if applicable.
+*   For descriptive moments (e.g., stadium shot, manager looking tense), generate a single detailed prompt.
+*   Focus on creating descriptive prompts suitable for Imagen 3. Emphasize action, emotion, setting, and relevant details like uniform descriptions based on the rules above.
+
+Output ONLY a JSON list of 3-5 prompt strings, formatted as a JSON string.
+Example JSON Output (as a string, not a Python list literal in the output):
+"[\\"An MLB batter in a white home uniform swinging a baseball bat powerfully...\\", \\"Baseball soaring high in the air...\\"]"
+If the dialogue is too short or no clear visual moments are identifiable, output an empty JSON list string: "[]".
+    """,
+    output_key="visual_generation_prompts_json", # Expects a JSON STRING
+)
+
+    visual_generator_mcp_caller_agent = LlmAgent( # Renamed for clarity
+    name="VisualGeneratorMCPCaller",
+    model=MODEL_ID,
+    instruction="""
+You are an image generation coordination robot.
+Expected in session state:
+- 'visual_generation_prompts_json_for_tool': A string that IS a valid JSON list of prompts (e.g., "[\\"prompt1\\", \\"prompt2\\"]").
+- 'game_pk': The current game_pk (as a string or number).
+
+Your SOLE task is to call the `visual_generator_mcp.generate_images_from_prompts` tool.
+1.  Retrieve the string value from session state key 'visual_generation_prompts_json_for_tool'.
+2.  Retrieve the value from session state key 'game_pk'. Convert 'game_pk' to its string representation.
+3.  Call the `visual_generator_mcp.generate_images_from_prompts` tool using these exact values:
+    - `prompts_json` parameter for the tool MUST be the string you retrieved from 'visual_generation_prompts_json_for_tool'.
+    - `game_pk_str` parameter for the tool MUST be the string representation of 'game_pk'.
+4.  The tool will return a JSON string (either a list of GCS URIs or an error object). Your output MUST be this exact JSON string returned by the tool.
+If the string from 'visual_generation_prompts_json_for_tool' is empty, "[]", or clearly not a JSON list of prompts, you should output the JSON string "[]" and DO NOT call the tool.
+    """,
+    tools=[tool for tool in loaded_mcp_tools_global.get("visual_generator_mcp", [])],
+    output_key="generated_visual_assets_uris_json", # Expects JSON string
+)
+
+    visual_critic_agent = LlmAgent(
+    name="VisualCritic",
+    model=MODEL_ID, # Or GEMINI_PRO_MODEL_ID
+    instruction="""
+You are a demanding visual producer reviewing generated images for an MLB highlight.
+The primary image generator (Imagen 3) cannot use specific player/team names.
+
+Expected in session state:
+- 'current_recap': The dialogue script for context.
+- 'assets_for_critique_json': A JSON string. This string contains a list of dictionaries, where each dictionary has "prompt_origin" (the prompt used) and "image_uri" (the GCS URI of the image generated for that prompt, or null if generation failed for that prompt).
+- 'prompts_used_for_critique_json': JSON string list of all prompts that WERE ATTEMPTED for generating the current set of images.
+
+Critique the set of generated images based on 'assets_for_critique_json' and their corresponding 'prompts_used_for_critique_json':
+1.  **Relevance to Dialogue & Prompts:** For each prompt in 'prompts_used_for_critique_json', check if its corresponding image in 'assets_for_critique_json' (if generation was successful, i.e., image_uri is not null) covers the key actions/scenes from 'current_recap' that the prompt targeted. Are there action gaps for successfully generated images?
+2.  **Failures:** Note any prompts for which image generation failed (image_uri is null).
+3.  **Quality/Action/Composition (for successful generations):** Are the images clear? Do they effectively convey the intended action, mood, or composition described in their 'prompt_origin', even if generic?
+4.  **Suggestions for Improvement (Action/Scene Focused & Generator-Safe):** If improvements are needed (either due to failed generations or poor quality/relevance of successful ones), suggest **specific new prompts** focusing on missing *actions* or improving *composition/mood*. **Ensure suggested prompts follow the generator limitations: NO specific player names, NO specific team names.** Use descriptive generic terms.
+
+If ALL attempted prompts resulted in successful, high-quality, relevant images OR if no prompts were provided initially, respond ONLY with "Visuals look sufficient."
+Otherwise, provide concise, bullet-point feedback and **specific, generator-safe prompt suggestions** for the *next* round of image generation.
+    """,
+    # NO TOOLS for the critic. It only generates text.
+    output_key="visual_critique_text",
+)
+
+    new_visual_prompts_from_critique_agent = LlmAgent(
+    name="NewVisualPromptsFromCritique",
+    model=GEMINI_PRO_MODEL_ID,
+    instruction="""
+You are an assistant director refining visual plans based on a critique.
+Expected in session state: 'visual_critique_text'.
+
+**Strict Image Generator Limitations (Enforce These):** NO Player Names, NO Team Names, Generic Uniforms.
+
+Task:
+Analyze `visual_critique_text`.
+If critique is "Visuals look sufficient." or empty, output an empty JSON list string: `"[]"`.
+Otherwise, identify visual concepts needing new/better images from the critique.
+Generate a JSON list of **2-4 NEW, concise, specific prompt strings** for these concepts.
+Prompts MUST be generator-safe and adhere to limitations.
+Translate specific player/team mentions from critique into compliant generic descriptions. Focus on action, setting, emotion.
+
+Example Critique: "Missing a shot of the double play. Home run image needs more excitement."
+Example Output (as a JSON string):
+"[\\"Dynamic action shot of two MLB fielders turning a double play...\\", \\"MLB batter celebrating enthusiastically after a home run...\\"]"
+
+Output ONLY a JSON list string.
+    """,
+    output_key="new_visual_generation_prompts_json", # JSON string
+)
+    visual_asset_workflow_agent_instance = VisualAssetWorkflowAgent(
+        name="VisualAssetWorkflow",
+        static_asset_query_generator=static_asset_query_generator_agent,
+        static_asset_retriever=static_asset_retriever_agent,
+        generated_visual_prompts_generator=generated_visual_prompts_agent,
+        visual_generator_mcp_caller=visual_generator_mcp_caller_agent, # Matching the LlmAgent instance name
+        visual_critic=visual_critic_agent,
+        new_visual_prompts_creator=new_visual_prompts_from_critique_agent,
+        max_visual_refinement_loops=1 # Example: 1 loop = 1 initial gen + 1 revision gen
+    )
+
     game_recap_assistant = GameRecapAgent(
         name="game_recap_assistant",
         initial_recap_generator=initial_recap_generator_agent,
@@ -603,6 +1052,7 @@ Output ONLY one word that best describes the overall tone: 'positive', 'negative
         recap_reviser=recap_reviser_agent,
         grammar_check=grammar_check_agent,
         tone_check=tone_check_agent,
+        visual_asset_workflow=visual_asset_workflow_agent_instance, 
     )
 
     root_agent = LlmAgent(
@@ -681,7 +1131,7 @@ async def _run_voice_agent_and_get_response(
 
 # main.py
 # ... (imports)
-
+_run_agent_and_get_response
 # --- Global variable for monkey-patching ---
 original_get_session = None # Defined globally
 
