@@ -94,7 +94,7 @@ server_configs_instance = AllServerConfigs(
         "mlb": mlb_stats_server_params,
         "web_search": web_search_server_params,         # NEW
         "bq_search": bq_vector_search_server_params, # NEW
-        "visual_generator_mcp": visual_asset_server_params, # MCP for Imagen/Cloudflare generation
+        "visual_assets": visual_asset_server_params, # MCP for Imagen/Cloudflare generation
         "static_retriever_mcp": static_retriever_server_params, # MCP for GCS headshot check
         "image_embedding_mcp": image_embedding_server_params, # MCP for logo vector search
     }
@@ -128,8 +128,11 @@ ROOT_AGENT_INSTRUCTION = """
 # This agent orchestrates the entire visual asset workflow, including static asset retrieval,
 # In main.py, after LlmAgent definitions for visuals
 
+# In main.py
+
 class VisualAssetWorkflowAgent(BaseAgent):
     model_config = {"arbitrary_types_allowed": True}
+    entity_extractor: LlmAgent
     static_asset_query_generator: LlmAgent
     static_asset_retriever: LlmAgent
     generated_visual_prompts_generator: LlmAgent
@@ -138,199 +141,191 @@ class VisualAssetWorkflowAgent(BaseAgent):
     new_visual_prompts_creator: LlmAgent
     max_visual_refinement_loops: int
 
-    def __init__(self, name: str, static_asset_query_generator: LlmAgent, static_asset_retriever: LlmAgent,
-                 generated_visual_prompts_generator: LlmAgent, visual_generator_mcp_caller: LlmAgent,
-                 visual_critic: LlmAgent, new_visual_prompts_creator: LlmAgent,
-                 max_visual_refinement_loops: int = 1):
+    def __init__(self, name: str, entity_extractor: LlmAgent, static_asset_query_generator: LlmAgent,
+                 static_asset_retriever: LlmAgent, generated_visual_prompts_generator: LlmAgent,
+                 visual_generator_mcp_caller: LlmAgent, visual_critic: LlmAgent,
+                 new_visual_prompts_creator: LlmAgent, max_visual_refinement_loops: int = 1):
         sub_agents_list_for_framework = [
-            static_asset_query_generator, static_asset_retriever,
+            entity_extractor, static_asset_query_generator, static_asset_retriever,
             generated_visual_prompts_generator, visual_generator_mcp_caller,
             visual_critic, new_visual_prompts_creator,
         ]
         super().__init__(
-            name=name, static_asset_query_generator=static_asset_query_generator,
+            name=name, entity_extractor=entity_extractor,
+            static_asset_query_generator=static_asset_query_generator,
             static_asset_retriever=static_asset_retriever,
             generated_visual_prompts_generator=generated_visual_prompts_generator,
             visual_generator_mcp_caller=visual_generator_mcp_caller,
             visual_critic=visual_critic, new_visual_prompts_creator=new_visual_prompts_creator,
             max_visual_refinement_loops=max_visual_refinement_loops,
-            sub_agents=sub_agents_list_for_framework)
+            sub_agents=sub_agents_list_for_framework
+        )
 
     def _clean_json_string_from_llm(self, raw_json_string: Optional[str], default_if_empty: str = "[]") -> str:
-        """Cleans potential markdown and extra quotes from LLM's JSON string output."""
-        if not raw_json_string:
-            return default_if_empty
-        
+        if not raw_json_string: return default_if_empty
         clean_string = raw_json_string.strip()
-        
-        # Remove markdown ```json ... ``` or ``` ... ```
         if clean_string.startswith("```json"):
-            clean_string = clean_string[7:] # Remove ```json
-            if clean_string.endswith("```"):
-                clean_string = clean_string[:-3] # Remove trailing ```
+            clean_string = clean_string[7:]
+            if clean_string.endswith("```"): clean_string = clean_string[:-3]
         elif clean_string.startswith("```"):
-            clean_string = clean_string[3:] # Remove ```
-            if clean_string.endswith("```"):
-                clean_string = clean_string[:-3] # Remove trailing ```
-        
-        clean_string = clean_string.strip()
-        
-        # Sometimes LLMs might add an extra layer of quotes around the JSON string itself
-        if clean_string.startswith('"') and clean_string.endswith('"') and clean_string.count('"') == 2:
-            try:
-                # Attempt to parse to see if the content within quotes is valid JSON
-                # This is tricky because the string itself IS the JSON content (e.g. "\"[]\"")
-                # For simple cases like "\"[]\"", removing outer quotes is fine.
-                # For complex escaped strings, this might break.
-                # A safer bet is to rely on the LLM prompt to output clean JSON string directly.
-                # For now, we'll assume the primary issue is markdown.
-                pass # Let's not aggressively strip quotes unless we are sure.
-            except json.JSONDecodeError:
-                pass # Not a simple quoted JSON string
-
-        return clean_string if clean_string else default_if_empty
-
+            clean_string = clean_string[3:]
+            if clean_string.endswith("```"): clean_string = clean_string[:-3]
+        return clean_string.strip() if clean_string.strip() else default_if_empty
 
     @override
     async def _run_async_impl(self, ctx: InvocationContext) -> AsyncGenerator[Event, None]:
         logger.info(f"[{self.name}] Starting visual asset workflow.")
-        # Ensure pre-requisites from GameRecapAgent are in state
-        final_dialogue_script = ctx.session.state.get("current_recap")
-        game_pk = ctx.session.state.get("game_pk", "unknown_game")
-        if "player_lookup_dict_json" not in ctx.session.state:
-            logger.warning(f"[{self.name}] 'player_lookup_dict_json' not set by GameRecapAgent. Headshot retrieval may fail.")
-            ctx.session.state["player_lookup_dict_json"] = "{}"
-
-        if not final_dialogue_script:
-            logger.warning(f"[{self.name}] 'current_recap' is missing. Cannot generate visuals.")
+        if not ctx.session.state.get("current_recap"):
+            logger.warning(f"[{self.name}] 'current_recap' missing. Skipping visual workflow.")
             ctx.session.state["all_visual_assets_list"] = []
             return
 
-        # --- 1. Static Asset Retrieval ---
+        # --- 1. Static Asset Retrieval Path ---
+        logger.info(f"[{self.name}] Running EntityExtractorForAssets...")
+        async for event in self.entity_extractor.run_async(ctx): yield event
+        
+        # Ensure 'extracted_entities_json' is clean before passing to next agent
+        raw_entities = ctx.session.state.get("extracted_entities_json", "{}")
+        ctx.session.state["extracted_entities_json"] = self._clean_json_string_from_llm(raw_entities, default_if_empty='{"players":[], "teams":[]}')
+
         logger.info(f"[{self.name}] Running StaticAssetQueryGenerator...")
         async for event in self.static_asset_query_generator.run_async(ctx): yield event
-        
+
+        # Ensure player_lookup_dict_json is present (should be set by GameRecapAgent)
+        if "player_lookup_dict_json" not in ctx.session.state:
+            ctx.session.state["player_lookup_dict_json"] = "{}"
+            logger.warning(f"[{self.name}] 'player_lookup_dict_json' was not in session state. Defaulted to empty. Headshot retrieval may be affected.")
+
         logger.info(f"[{self.name}] Running StaticAssetRetriever...")
         async for event in self.static_asset_retriever.run_async(ctx): yield event
         
-        retrieved_static_assets_json_raw = ctx.session.state.get("retrieved_static_assets_json", "[]")
-        retrieved_static_assets_json_clean = self._clean_json_string_from_llm(retrieved_static_assets_json_raw)
+        retrieved_static_assets_json_clean = self._clean_json_string_from_llm(ctx.session.state.get("retrieved_static_assets_json", "[]"))
         try:
             current_static_assets_list = json.loads(retrieved_static_assets_json_clean)
             if not isinstance(current_static_assets_list, list): current_static_assets_list = []
-        except json.JSONDecodeError as e:
-            logger.error(f"[{self.name}] Failed to parse static assets JSON: {e}. Raw: '{retrieved_static_assets_json_raw}', Cleaned: '{retrieved_static_assets_json_clean}'")
-            current_static_assets_list = []
+        except json.JSONDecodeError: current_static_assets_list = []
         logger.info(f"[{self.name}] Retrieved {len(current_static_assets_list)} static assets.")
 
         # --- 2. Iterative Generative Visuals Workflow ---
         logger.info(f"[{self.name}] Running GeneratedVisualPromptsGenerator (for initial prompts)...")
         async for event in self.generated_visual_prompts_generator.run_async(ctx): yield event
-
-        all_generated_assets_details = [] # Store dicts: {prompt_origin, image_uri, type, iteration}
         
-        # This key will hold the JSON *string* of prompts for the current iteration
-        current_prompts_json_for_generator = self._clean_json_string_from_llm(
+        # Initial prompts are set by generated_visual_prompts_generator into 'visual_generation_prompts_json'
+        # This will be the starting point for the loop's prompt source.
+        current_prompts_json_for_next_iteration = self._clean_json_string_from_llm(
             ctx.session.state.get("visual_generation_prompts_json", "[]")
         )
-        ctx.session.state["visual_generation_prompts_json_cleaned_for_tool"] = current_prompts_json_for_generator
+        logger.info(f"[{self.name}] Initial cleaned prompts JSON for visual gen: {current_prompts_json_for_next_iteration}")
 
+
+        all_generated_assets_details = []
 
         for i in range(self.max_visual_refinement_loops + 1):
-            logger.info(f"[{self.name}] Visual generation/refinement iteration {i+1}/{self.max_visual_refinement_loops + 1}")
+            iteration_label = f"Iteration {i+1}/{self.max_visual_refinement_loops + 1}"
+            logger.info(f"[{self.name}] Visual generation/refinement {iteration_label}")
             
-            current_prompts_json_str_for_iter = ctx.session.state.get("visual_generation_prompts_json_cleaned_for_tool", "[]")
+            # Use the prompts prepared for this iteration
+            prompts_to_use_this_iteration_str = current_prompts_json_for_next_iteration
             
+            current_prompts_list_for_iter = []
             try:
-                current_prompts_list_for_iter = json.loads(current_prompts_json_str_for_iter)
-                if not isinstance(current_prompts_list_for_iter, list) or not current_prompts_list_for_iter:
-                    log_msg = f"[{self.name}] No visual prompts for iteration {i+1}."
-                    if i == 0: logger.warning(log_msg + " Ending visual generation.")
+                parsed_list = json.loads(prompts_to_use_this_iteration_str)
+                if isinstance(parsed_list, list) and parsed_list: # Ensure it's a non-empty list
+                    current_prompts_list_for_iter = parsed_list
+                else:
+                    log_msg = f"[{self.name}] No valid visual prompts for {iteration_label}."
+                    if i == 0: logger.warning(log_msg + " Ending visual generation. Prompt string was: '{prompts_to_use_this_iteration_str}'")
                     else: logger.info(log_msg + " Ending visual refinement.")
-                    break
+                    break 
             except json.JSONDecodeError as e:
-                logger.error(f"[{self.name}] Invalid JSON for prompts in iter {i+1}. Error: {e}. JSON: '{current_prompts_json_str_for_iter}'. Stopping.")
+                logger.error(f"[{self.name}] Invalid JSON for prompts in {iteration_label}. Error: {e}. JSON: '{prompts_to_use_this_iteration_str}'. Stopping.")
                 break
             
-            logger.info(f"[{self.name}] Iter {i+1}: VisualGeneratorMCPCaller using prompts: {current_prompts_json_str_for_iter}")
-            # VisualGeneratorMCPCaller LlmAgent needs 'visual_generation_prompts_json' (as string) and 'game_pk'
-            # We've put the cleaned string into 'visual_generation_prompts_json_cleaned_for_tool'
-            # The LlmAgent for VisualGeneratorMCPCaller should be instructed to use this key,
-            # or we update the original 'visual_generation_prompts_json' key with the cleaned string.
-            # Let's update the original key for simplicity of LlmAgent instruction.
-            ctx.session.state['visual_generation_prompts_json'] = current_prompts_json_str_for_iter
-
+            # Set the exact key the VisualGeneratorMCPCaller LlmAgent expects
+            ctx.session.state['visual_generation_prompts_json_for_tool'] = prompts_to_use_this_iteration_str
+            current_game_pk = ctx.session.state.get("game_pk", "unknown_game")
+            ctx.session.state['game_pk_str_for_tool'] = str(current_game_pk) # LLM reads this
+            logger.info(f"[{self.name}] {iteration_label}: Set 'visual_generation_prompts_json_for_tool' to: {prompts_to_use_this_iteration_str}")
+            logger.info(f"[{self.name}] {iteration_label}: Set 'game_pk_str_for_tool' to: {str(current_game_pk)}")
+            
+            logger.info(f"[{self.name}] {iteration_label}: Calling VisualGeneratorMCPCaller with {len(current_prompts_list_for_iter)} prompts.")
             async for event in self.visual_generator_mcp_caller.run_async(ctx): yield event
             
             generated_uris_this_iter_json_raw = ctx.session.state.get("generated_visual_assets_uris_json", "[]")
-            generated_uris_this_iter_json_clean = self._clean_json_string_from_llm(generated_uris_this_iter_json_raw)
-            
-            generated_uris_this_iter = []
-            try:
-                parsed_uris = json.loads(generated_uris_this_iter_json_clean)
-                if isinstance(parsed_uris, list):
-                    generated_uris_this_iter = [uri for uri in parsed_uris if isinstance(uri, str) and uri.startswith("gs://")]
-                elif isinstance(parsed_uris, dict) and parsed_uris.get("error"): # Handle MCP tool error
-                    logger.error(f"[{self.name}] MCP Visual Generator tool returned error: {parsed_uris.get('error')}")
-            except json.JSONDecodeError as e:
-                logger.error(f"[{self.name}] Failed to parse JSON from VisualGeneratorMCPCaller: {e}. Raw: '{generated_uris_this_iter_json_raw}', Cleaned: '{generated_uris_this_iter_json_clean}'")
+            # It's crucial that visual_generator_mcp_caller_agent's output (which becomes generated_visual_assets_uris_json)
+            # is a JSON string from the MCP tool, even if it's an error JSON like '{"error": "..."}' or an empty list '[]'
+            generated_uris_this_iter_json_clean = self._clean_json_string_from_llm(generated_uris_this_iter_json_raw, default_if_empty="[]")
+            logger.info(f"[{self.name}] {iteration_label}: Raw output from VisualGeneratorMCPCaller: '{generated_uris_this_iter_json_raw}'")
+            logger.info(f"[{self.name}] {iteration_label}: Cleaned output from VisualGeneratorMCPCaller: '{generated_uris_this_iter_json_clean}'")
 
+            generated_uris_this_iter = []
+            tool_had_error = False
+            try:
+                parsed_uris_result = json.loads(generated_uris_this_iter_json_clean)
+                if isinstance(parsed_uris_result, list):
+                    generated_uris_this_iter = [uri for uri in parsed_uris_result if isinstance(uri, str) and uri.startswith("gs://")]
+                    logger.info(f"[{self.name}] {iteration_label}: Successfully parsed {len(generated_uris_this_iter)} URIs.")
+                elif isinstance(parsed_uris_result, dict) and parsed_uris_result.get("error"):
+                    logger.error(f"[{self.name}] {iteration_label}: VisualGeneratorMCPCaller tool explicitly returned an error: {parsed_uris_result['error']}")
+                    tool_had_error = True # Mark that the tool itself reported an error
+                else:
+                    logger.warning(f"[{self.name}] {iteration_label}: VisualGeneratorMCPCaller output was not a list of URIs or an error dict: {generated_uris_this_iter_json_clean}")
+            except json.JSONDecodeError as e:
+                logger.error(f"[{self.name}] {iteration_label}: Failed to parse JSON output from VisualGeneratorMCPCaller. Error: {e}. Cleaned JSON: '{generated_uris_this_iter_json_clean}'")
+                tool_had_error = True # Treat parse error as a tool failure for this iteration
+
+            # Prepare assets for the critic, even if generation failed for some/all
             assets_for_critique_this_iteration = []
-            for idx, prompt_text in enumerate(current_prompts_list_for_iter):
-                asset_detail = {
-                    "prompt_origin": prompt_text,
-                    "image_uri": generated_uris_this_iter[idx] if idx < len(generated_uris_this_iter) else None,
-                    "type": "generated_image" # Generic type
-                }
-                assets_for_critique_this_iteration.append(asset_detail)
-                if asset_detail["image_uri"]:
-                    all_generated_assets_details.append({**asset_detail, "iteration": i + 1})
+            for idx, prompt_text in enumerate(current_prompts_list_for_iter): # Use the parsed list of prompts
+                asset_uri = generated_uris_this_iter[idx] if idx < len(generated_uris_this_iter) else None
+                assets_for_critique_this_iteration.append({"prompt_origin": prompt_text, "image_uri": asset_uri, "type": "generated_image"})
+                if asset_uri: # Only add successfully generated assets to the main list
+                    all_generated_assets_details.append({"prompt_origin": prompt_text, "image_uri": asset_uri, "type": "generated_image", "iteration": i + 1})
             
             ctx.session.state["assets_for_critique_json"] = json.dumps(assets_for_critique_this_iteration)
-            ctx.session.state["prompts_used_for_critique_json"] = current_prompts_json_str_for_iter
-
+            ctx.session.state["prompts_used_for_critique_json"] = prompts_to_use_this_iteration_str
 
             if i >= self.max_visual_refinement_loops:
-                logger.info(f"[{self.name}] Reached max visual refinement loops. No further critique.")
+                logger.info(f"[{self.name}] Reached max visual refinement loops ({self.max_visual_refinement_loops}). No further critique.")
                 break
+            
+            # If the tool itself had an error (e.g., Imagen quota, invalid input to MCP tool),
+            # the critique might not be useful, or it might suggest retrying.
+            # For now, we proceed to critique even if tool_had_error is true, the critic can see null URIs.
 
-            logger.info(f"[{self.name}] Iter {i+1}: Running VisualCritic...")
+            logger.info(f"[{self.name}] {iteration_label}: Running VisualCritic...")
             async for event in self.visual_critic.run_async(ctx): yield event
             
             critique_text = ctx.session.state.get("visual_critique_text", "")
-            logger.info(f"[{self.name}] Iter {i+1} Visual Critique: {critique_text[:150]}...")
+            logger.info(f"[{self.name}] {iteration_label} Visual Critique: {critique_text[:150]}...")
             if "sufficient" in critique_text.lower():
-                logger.info(f"[{self.name}] Visuals deemed sufficient. Ending refinement.")
+                logger.info(f"[{self.name}] Visuals deemed sufficient by critic. Ending visual refinement.")
                 break
 
-            logger.info(f"[{self.name}] Iter {i+1}: Running NewVisualPromptsFromCritique...")
+            logger.info(f"[{self.name}] {iteration_label}: Running NewVisualPromptsFromCritique...")
             async for event in self.new_visual_prompts_creator.run_async(ctx): yield event
             
             new_prompts_json_raw = ctx.session.state.get("new_visual_generation_prompts_json", "[]")
-            new_prompts_json_clean = self._clean_json_string_from_llm(new_prompts_json_raw)
-            ctx.session.state["visual_generation_prompts_json_cleaned_for_tool"] = new_prompts_json_clean # For next iteration
+            current_prompts_json_for_next_iteration = self._clean_json_string_from_llm(new_prompts_json_raw) # Prepare for next loop
+            logger.info(f"[{self.name}] {iteration_label}: New prompts for next iter: {current_prompts_json_for_next_iteration}")
 
             try:
-                new_prompts_list = json.loads(new_prompts_json_clean)
+                new_prompts_list = json.loads(current_prompts_json_for_next_iteration)
                 if not isinstance(new_prompts_list, list) or not new_prompts_list:
-                    logger.info(f"[{self.name}] Critique yielded no new prompts. Ending refinement.")
+                    logger.info(f"[{self.name}] Critique yielded no new prompts. Ending visual refinement loop after {iteration_label}.")
                     break
             except json.JSONDecodeError:
-                logger.error(f"[{self.name}] Invalid JSON for new prompts: '{new_prompts_json_clean}'. Ending.")
+                logger.error(f"[{self.name}] Invalid JSON for new prompts: '{current_prompts_json_for_next_iteration}'. Ending.")
                 break
         
-        final_generated_visuals_dict = {}
-        for asset in sorted(all_generated_assets_details, key=lambda x: x.get("iteration", 0)):
-            if asset.get("image_uri"):
-                final_generated_visuals_dict[asset["image_uri"]] = asset # Deduplicate by URI, keeping latest
-        
+        # ... (rest of the _run_async_impl: combining static and generated assets) ...
+        final_generated_visuals_dict = {asset["image_uri"]: asset for asset in all_generated_assets_details if asset.get("image_uri")}
         all_visual_assets_list = current_static_assets_list + list(final_generated_visuals_dict.values())
         ctx.session.state["all_visual_assets_list"] = all_visual_assets_list
         logger.info(f"[{self.name}] Visual asset workflow finished. Total unique assets: {len(all_visual_assets_list)}")
+        logger.info(f"[{self.name}] Generated visuals workflow finished. Total assets: {len(final_generated_visuals_dict.values())}")
 
 
-
- 
 #################################################################################################################
 #################################################################################################################
 # --- GameRecapAgent Definition (Patterned after StoryFlowAgent) ---
@@ -449,91 +444,58 @@ class GameRecapAgent(BaseAgent):
 
         # --- 1. Dialogue Generation & Refinement ---
         logger.info(f"[{self.name}] Running InitialRecapGenerator (Dialogue)...")
-        # This LlmAgent will yield its own events, including the final ModelContentEvent with the initial recap
-        async for event in self.initial_recap_generator.run_async(ctx):
-            yield event # Pass these events up
+        async for event in self.initial_recap_generator.run_async(ctx): yield event
         
         dialogue_after_initial_gen = ctx.session.state.get("current_recap", "")
-        # Check for agent_exit or game not final conditions often set by InitialRecapGenerator
-        if not dialogue_after_initial_gen or \
-           "game is not final" in dialogue_after_initial_gen.lower() or \
-           "agent_exit" in dialogue_after_initial_gen.lower() or \
-           ctx.session.state.get("agent_should_exit_flag", False): # A more explicit flag
-            logger.warning(f"[{self.name}] Initial recap indicates game not final, agent exit, or failure. Recap: '{dialogue_after_initial_gen}'. Current state: {ctx.session.state}")
-            # The last event yielded by initial_recap_generator (if it contained text) would be the final response.
-            # If it was just an agent_exit tool call, no text might have been yielded.
-            # Ensure *something* is yielded as the final response for this turn.
-            if not dialogue_after_initial_gen and not ctx.session.state.get("agent_should_exit_flag", False) : # If it's truly empty and not an exit
-                 dialogue_after_initial_gen = "Could not generate initial recap due to game status or other issue."
-                 ctx.session.state["current_recap"] = dialogue_after_initial_gen # Update state for final yield
-                 # Yield a constructed event IF the sub-agent didn't yield a final textual one
-                 yield Event(
-                     author=self.name, # This agent is deciding the final output
-                     content=types.Content(role="model", parts=[types.Part(text=dialogue_after_initial_gen)]),
-                     invocation_context=ctx # ADK needs invocation_context to build full event
-                 )
-            # If initial_recap_generator already yielded its text, that's fine, the runner takes the last model content.
-            return # Exit the GameRecapAgent's flow
+        agent_should_exit = ctx.session.state.get("agent_should_exit_flag", False) # Check for an explicit exit flag
+
+        if agent_should_exit or not dialogue_after_initial_gen or "game is not final" in dialogue_after_initial_gen.lower():
+            message = dialogue_after_initial_gen or "Recap generation stopped early due to game status or other conditions."
+            logger.warning(f"[{self.name}] Initial recap phase indicated exit. Finalizing with message: {message}")
+            yield Event(
+                author=self.name,
+                content=types.Content(role="model", parts=[types.Part(text=message)]),
+                # No invocation_context here
+            )
+            return
 
         logger.info(f"[{self.name}] Running Dialogue RefinementLoop (self.refinement_loop)...")
-        async for event in self.refinement_loop.run_async(ctx): # Dialogue refinement loop
-            yield event
+        async for event in self.refinement_loop.run_async(ctx): yield event
         
         logger.info(f"[{self.name}] Running Dialogue PostProcessing Sequence (self.post_processing_sequence)...")
-        async for event in self.post_processing_sequence.run_async(ctx): # Dialogue post-processing
-            yield event
+        async for event in self.post_processing_sequence.run_async(ctx): yield event
 
         final_dialogue_recap = ctx.session.state.get("current_recap", "")
         if not final_dialogue_recap:
             logger.error(f"[{self.name}] Dialogue recap is empty after refinement. Aborting.")
-            yield Event( # Construct and yield an event
+            yield Event(
                 author=self.name,
-                content=types.Content(role="model", parts=[types.Part(text="Failed to produce dialogue recap after refinement.")]) ,
-                invocation_context=ctx
+                content=types.Content(role="model", parts=[types.Part(text="Failed to produce dialogue recap after refinement.")])
+                # No invocation_context here
             )
             return
         logger.info(f"[{self.name}] Dialogue workflow finished. Final dialogue (first 100 chars): {final_dialogue_recap[:100]}...")
 
         # --- 2. Visual Asset Workflow ---
         logger.info(f"[{self.name}] Running VisualAssetWorkflow (self.visual_asset_workflow)...")
-        # The VisualAssetWorkflowAgent itself doesn't produce a direct textual output for the user;
-        # it populates session state with 'all_visual_assets_list'.
-        # We still need to yield its internal events for logging and tracing.
-        async for event in self.visual_asset_workflow.run_async(ctx):
-            yield event
+        async for event in self.visual_asset_workflow.run_async(ctx): yield event
         
         all_visual_assets = ctx.session.state.get("all_visual_assets_list", [])
         logger.info(f"[{self.name}] VisualAssetWorkflow finished. Found/generated {len(all_visual_assets)} visual assets (available in session state).")
 
         # --- 3. Final Output Event for GameRecapAgent ---
-        # The main textual output for this GameRecapAgent is the final_dialogue_recap.
-        # The visual assets are in the session state for the application to use.
-        # We need to ensure that an Event with final_dialogue_recap is the last *ModelContentEvent* yielded
-        # if we want that to be the primary textual response picked up by the runner.
-        
-        # The self.post_processing_sequence (ending with tone_check_agent) would have been the last
-        # agent to yield a ModelContentEvent. If tone_check_agent's output ("positive", "negative")
-        # is not what we want as the final text to the user, we must explicitly yield the dialogue here.
-
         logger.info(f"[{self.name}] Yielding final dialogue recap as the main textual output.")
         final_event_for_dialogue = Event(
-            author=self.name, # This GameRecapAgent is the author of this final consolidated textual output
+            author=self.name,
             content=types.Content(role="model", parts=[types.Part(text=final_dialogue_recap)]),
-            # ADK framework will fill in other Event fields like id, timestamp, invocation_id (from ctx)
-            # when it processes this yielded event through session_service.append_event
-            invocation_context=ctx # Pass context for the framework to build the full event
+            # No invocation_context here. Framework handles it.
+            # ADK will automatically populate id, timestamp, and associate with the current invocation.
         )
         yield final_event_for_dialogue
 
         logger.info(f"[{self.name}] === GameRecapAgent processing complete. Yielded final dialogue. Visuals in state. ===")
 ############################################################################################################################################
 ############################################################################################################################################
-
-
-
-
-
-
 
 
 # --- Tool Collection ---
@@ -872,28 +834,67 @@ Output ONLY one word that best describes the overall tone: 'positive', 'negative
         output_key="tone_check_result",
     )
 
-# --- Sub-Agents for VisualAssetWorkflowAgent ---
-
-# In main.py, within create_agent_with_preloaded_tools function
 
 # --- Sub-Agents for VisualAssetWorkflowAgent ---
 
+    entity_extractor_agent = LlmAgent(
+        name="EntityExtractorForAssets",
+        model=MODEL_ID, # Can be a fast model like gemini-2.0-flash
+        instruction="""
+You are a text analysis assistant.
+Read the dialogue script provided in session state key 'current_recap'.
+Identify all unique full player names (e.g., "Willy Adames", "Shohei Ohtani") and unique full MLB team names (e.g., "Los Angeles Angels", "Milwaukee Brewers") mentioned in the script.
+The team names should be the full official names if present (e.g. "Los Angeles Dodgers", not just "Dodgers" if the full name appears). Prioritize full names.
+
+Output a JSON object with two keys:
+- "players": A list of unique player full name strings.
+- "teams": A list of unique MLB team full name strings.
+
+Example Input Script (from 'current_recap'):
+"Host A: The Los Angeles Angels fought hard, but the New York Yankees were too strong today.
+ Host B: Definitely, and Shohei Ohtani had a great game for the Angels, even in a loss. Aaron Judge, on the other hand, was unstoppable for the Yankees."
+
+Example Output (as a JSON string):
+{
+  "players": ["Shohei Ohtani", "Aaron Judge"],
+  "teams": ["Los Angeles Angels", "New York Yankees"]
+}
+
+If no players or teams are found, output empty lists within the JSON object (e.g., {"players": [], "teams": []}).
+Ensure your entire output is a single, valid JSON string.
+        """,
+        output_key="extracted_entities_json" # This will be a JSON string
+    )
+
+    # Now, update StaticAssetQueryGenerator to use this output
     static_asset_query_generator_agent = LlmAgent(
-    name="StaticAssetQueryGenerator",
-    model=MODEL_ID,
-    instruction="""
-You are an asset planner. The final dialogue script for an MLB game recap is in session state key 'current_recap'.
-Analyze this script to identify all specific MLB teams (e.g., "Los Angeles Angels", "Boston Red Sox") and player full names mentioned.
-For each full team name, generate a query string: "[Full Team Name] logo".
-For each player full name, generate: "[Player Full Name] headshot".
-Output ONLY a JSON list of these search query strings. If no relevant entities, output an empty list [].
+        name="StaticAssetQueryGenerator",
+        model=MODEL_ID,
+        instruction="""
+You are an asset planner.
+Expected in session state: 'extracted_entities_json', which is a JSON string like '{"players": ["Player A Full Name"], "teams": ["Full Team Name X"]}'.
 
-Example dialogue script: "Host A: The Los Angeles Angels really showed up today! Host B: Absolutely, and Willy Adames was key with that double for the Brewers."
-Example JSON Output:
-["Los Angeles Angels logo", "Willy Adames headshot", "Milwaukee Brewers logo"]
-    """,
-    output_key="static_asset_search_queries_json",
-)
+Your task:
+1. Parse the JSON string from 'extracted_entities_json' to get lists of player names and team names.
+2. For each full team name in the "teams" list, generate a query string: "[Full Team Name] logo".
+3. For each player full name in the "players" list, generate a query string: "[Player Full Name] headshot".
+4. Combine all these generated query strings into a single list.
+5. Output this final list of query strings as a single, valid JSON string.
+
+Example Input ('extracted_entities_json'):
+'{"players": ["Shohei Ohtani", "Aaron Judge"], "teams": ["Los Angeles Angels", "New York Yankees"]}'
+
+Example Output (as a JSON string):
+"[\\"Los Angeles Angels logo\\", \\"New York Yankees logo\\", \\"Shohei Ohtani headshot\\", \\"Aaron Judge headshot\\"]"
+
+If the input 'extracted_entities_json' is empty or represents no entities (e.g., '{"players": [], "teams": []}'),
+then output an empty JSON list string: "[]".
+        """,
+        # No tools needed for this agent, it just transforms data from session state
+        output_key="static_asset_search_queries_json", # Still outputs a JSON string
+    )
+
+    # ... (rest of your LlmAgent definitions for visual_generator_mcp_caller_agent, etc.)
 
     static_asset_retriever_agent = LlmAgent(
     name="StaticAssetRetriever",
@@ -953,9 +954,9 @@ Identify 3-5 key moments, scenes, or actions described in the dialogue that need
 *   For descriptive moments (e.g., stadium shot, manager looking tense), generate a single detailed prompt.
 *   Focus on creating descriptive prompts suitable for Imagen 3. Emphasize action, emotion, setting, and relevant details like uniform descriptions based on the rules above.
 
-Output ONLY a JSON list of 3-5 prompt strings, formatted as a JSON string.
-Example JSON Output (as a string, not a Python list literal in the output):
-"[\\"An MLB batter in a white home uniform swinging a baseball bat powerfully...\\", \\"Baseball soaring high in the air...\\"]"
+Output ONLY a JSON list of 3-5 prompt strings, formatted AS A JSON STRING.
+Example JSON Output (as a string): "[\\"Prompt 1...\\", \\"Prompt 2...\\"]"
+If no clear visual moments, output an empty JSON list string: "[]".
 If the dialogue is too short or no clear visual moments are identifiable, output an empty JSON list string: "[]".
     """,
     output_key="visual_generation_prompts_json", # Expects a JSON STRING
@@ -967,19 +968,20 @@ If the dialogue is too short or no clear visual moments are identifiable, output
     instruction="""
 You are an image generation coordination robot.
 Expected in session state:
-- 'visual_generation_prompts_json_for_tool': A string that IS a valid JSON list of prompts (e.g., "[\\"prompt1\\", \\"prompt2\\"]").
-- 'game_pk': The current game_pk (as a string or number).
 
-Your SOLE task is to call the `visual_generator_mcp.generate_images_from_prompts` tool.
-1.  Retrieve the string value from session state key 'visual_generation_prompts_json_for_tool'.
-2.  Retrieve the value from session state key 'game_pk'. Convert 'game_pk' to its string representation.
-3.  Call the `visual_generator_mcp.generate_images_from_prompts` tool using these exact values:
-    - `prompts_json` parameter for the tool MUST be the string you retrieved from 'visual_generation_prompts_json_for_tool'.
-    - `game_pk_str` parameter for the tool MUST be the string representation of 'game_pk'.
-4.  The tool will return a JSON string (either a list of GCS URIs or an error object). Your output MUST be this exact JSON string returned by the tool.
-If the string from 'visual_generation_prompts_json_for_tool' is empty, "[]", or clearly not a JSON list of prompts, you should output the JSON string "[]" and DO NOT call the tool.
+- 'game_pk': The current game_pk (as a string or number).
+- 'visual_generation_prompts_json_for_tool': A string that IS a valid JSON list of image generation prompts (e.g., "[\\"prompt1 text\\", \\"prompt2 text\\"]").
+Your ONLY function is to execute the `visual_assets.generate_images_from_prompts` tool and return its raw JSON string output.
+You will receive `prompts_json_string` (this is already a JSON formatted string list of prompts) from session state key 'visual_generation_prompts_json_for_tool'.
+You will receive `game_pk_string` (this is already a string) from session state key 'game_pk_str_for_tool'.
+
+Immediately call the `visual_assets.generate_images_from_prompts` tool.
+Use the exact `prompts_json_string` you received for the tool's `prompts_json` parameter.
+Use the exact `game_pk_string` you received for the tool's `game_pk_str` parameter.
+Your entire response MUST be ONLY the direct, verbatim JSON string output from the `visual_assets_mcp.generate_images_from_prompts` tool.
+Do not add any other text, explanation, or formatting.
     """,
-    tools=[tool for tool in loaded_mcp_tools_global.get("visual_generator_mcp", [])],
+    tools=[tool for tool in loaded_mcp_tools_global.get("visual_assets", [])],
     output_key="generated_visual_assets_uris_json", # Expects JSON string
 )
 
@@ -992,7 +994,7 @@ The primary image generator (Imagen 3) cannot use specific player/team names.
 
 Expected in session state:
 - 'current_recap': The dialogue script for context.
-- 'assets_for_critique_json': A JSON string. This string contains a list of dictionaries, where each dictionary has "prompt_origin" (the prompt used) and "image_uri" (the GCS URI of the image generated for that prompt, or null if generation failed for that prompt).
+- 'assets_for_critique_json': JSON string list of dicts: `[{"prompt_origin": "...", "image_uri": "gs://..." or null}]`.
 - 'prompts_used_for_critique_json': JSON string list of all prompts that WERE ATTEMPTED for generating the current set of images.
 
 Critique the set of generated images based on 'assets_for_critique_json' and their corresponding 'prompts_used_for_critique_json':
@@ -1033,8 +1035,10 @@ Output ONLY a JSON list string.
     """,
     output_key="new_visual_generation_prompts_json", # JSON string
 )
+    
     visual_asset_workflow_agent_instance = VisualAssetWorkflowAgent(
         name="VisualAssetWorkflow",
+        entity_extractor=entity_extractor_agent,
         static_asset_query_generator=static_asset_query_generator_agent,
         static_asset_retriever=static_asset_retriever_agent,
         generated_visual_prompts_generator=generated_visual_prompts_agent,
