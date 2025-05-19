@@ -140,7 +140,7 @@ async def _generate_image_cloudflare_async(prompt: str, width: int = 768, height
 # --- MCP Tool ---
 
 @mcp.tool()
-async def generate_images_from_prompts(prompts_json: str, game_pk_str: str = "unknown_game") -> str:
+async def generate_images_from_prompts(prompts: List[str], game_pk_str: str = "unknown_game") -> str:
     """
     Generates images for a list of prompts using Imagen, with Cloudflare fallback.
     Expects prompts_json as a JSON string list. Returns a JSON string list of GCS URIs.
@@ -151,14 +151,9 @@ async def generate_images_from_prompts(prompts_json: str, game_pk_str: str = "un
     if not storage_client:
         return json.dumps({"error": "GCS client not initialized."})
 
-    try:
-        prompts: List[str] = json.loads(prompts_json)
-        if not isinstance(prompts, list) or not all(isinstance(p, str) for p in prompts):
-            raise ValueError("Input must be a JSON list of strings.")
-    except (json.JSONDecodeError, ValueError) as e:
-        logger.error(f"Invalid prompts_json input: {e}")
-        return json.dumps({"error": f"Invalid input: {e}"})
-
+    if not isinstance(prompts, list) or not all(isinstance(p, str) for p in prompts):
+        logger.error(f"MCP Tool received invalid 'prompts' type. Expected List[str], got {type(prompts)}. Value: {prompts}")
+        return json.dumps({"error": f"MCP Tool received invalid 'prompts' type. Expected List[str], got {type(prompts)}."})
     if not prompts:
         logger.info("No prompts provided for image generation.")
         return json.dumps([]) # Return empty list
