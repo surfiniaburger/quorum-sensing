@@ -38,7 +38,7 @@ MAX_PROMPTS_TO_ANIMATE_PER_CALL = int(os.getenv("MAX_PROMPTS_TO_ANIMATE_PER_CALL
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-mcp = FastMCP("video_clip_generator")
+mcp = FastMCP("video_clip_generator_mcp")
 
 # --- Initialize Clients ---
 storage_client = None
@@ -56,7 +56,7 @@ except Exception as e:
 # --- MCP Tool ---
 
 @mcp.tool()
-async def generate_video_clips_from_prompts(prompts: str, game_pk_str: str = "unknown_game") -> str:
+async def generate_video_clips_from_prompts(prompts: List[str], game_pk_str: str = "unknown_game") -> str:
     """
     Generates short video clips from text prompts using Veo.
     Expects prompts_json as a list of strings. Returns a JSON string list of GCS URIs.
