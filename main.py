@@ -89,6 +89,11 @@ video_clip_server_params = StdioServerParameters( # NEW
     command="python",
     args=["./mcp_server/video_clip_server.py"],
 )
+audio_processing_server_params = StdioServerParameters( # NEW - for TTS and STT
+    command="python",
+    args=["./mcp_server/audio_processing_server.py"], # Path to your audio server
+)
+
 
 server_configs_instance = AllServerConfigs(
     configs={
@@ -102,6 +107,7 @@ server_configs_instance = AllServerConfigs(
         "static_retriever_mcp": static_retriever_server_params, # MCP for GCS headshot check
         "image_embedding_mcp": image_embedding_server_params, # MCP for logo vector search
         "video_clip_generator_mcp": video_clip_server_params, 
+        "audio_processing_mcp": audio_processing_server_params, 
     }
 )
 
@@ -282,21 +288,53 @@ class IterativeImageGenerationAgent(BaseAgent):
             tool_output_json_string_clean = _clean_json_string_from_llm(tool_output_json_string_raw, default_if_empty='"[]"')
             
             generated_uris_this_iter = []
+            tool_had_error_flag = False # Add a flag
             try:
                 parsed_tool_output_content = json.loads(tool_output_json_string_clean)
+                logger.info(f"[{self.name}] {iteration_label}: Parsed tool output content: {parsed_tool_output_content} (Type: {type(parsed_tool_output_content)})")
                 if isinstance(parsed_tool_output_content, list):
                     generated_uris_this_iter = [uri for uri in parsed_tool_output_content if isinstance(uri, str) and uri.startswith("gs://")]
+                    logger.info(f"[{self.name}] {iteration_label}: Successfully parsed {len(generated_uris_this_iter)} URIs: {generated_uris_this_iter}")
                 elif isinstance(parsed_tool_output_content, dict) and parsed_tool_output_content.get("error"):
                     logger.error(f"[{self.name}] {iteration_label}: MCP tool error: {parsed_tool_output_content['error']}")
+                    tool_had_error_flag = True
+                else:
+                    logger.warning(f"[{self.name}] {iteration_label}: Parsed tool output was not a list or error dict: {parsed_tool_output_content} (Type: {type(parsed_tool_output_content)})")
+                    if isinstance(parsed_tool_output_content, str):
+                        logger.info(f"[{self.name}] {iteration_label}: Attempting secondary parse on string: {parsed_tool_output_content[:100]}...")
+
+                        try:
+                            secondary_parsed_output = json.loads(parsed_tool_output_content)
+                            if isinstance(secondary_parsed_output, list):
+                                generated_uris_this_iter = [uri for uri in secondary_parsed_output if isinstance(uri, str) and uri.startswith("gs://")]
+                                logger.info(f"[{self.name}] {iteration_label}: Successfully parsed {len(generated_uris_this_iter)} URIs from secondary parse: {generated_uris_this_iter}")
+                            else:
+                                logger.warning(f"[{self.name}] {iteration_label}: Secondary parse did not yield a list: {secondary_parsed_output} (Type: {type(secondary_parsed_output)})")
+                        except json.JSONDecodeError as e2:
+                            logger.error(f"[{self.name}] {iteration_label}: Secondary JSON parse failed. Error: {e2}. String was: '{parsed_tool_output_content}'")
+                            tool_had_error_flag = True
                 # Simplified error handling for brevity; refer to original for more detailed secondary parsing
             except json.JSONDecodeError as e:
                 logger.error(f"[{self.name}] {iteration_label}: JSON parse of tool output failed. Error: {e}. Output: '{tool_output_json_string_clean}'")
+                tool_had_error_flag = True
 
             assets_for_critique_this_iteration = []
+            if not current_prompts_list_for_iter:
+                logger.warning(f"[{self.name}] {iteration_label}: No prompts were available for this iteration. Skipping asset detail appending.")
+            elif tool_had_error_flag and not generated_uris_this_iter: # If tool errored AND we have no URIs
+                logger.warning(f"[{self.name}] {iteration_label}: Tool reported an error or parsing failed, and no URIs were extracted. Associating null URIs with prompts.")
+                for prompt_text in current_prompts_list_for_iter:
+                    assets_for_critique_this_iteration.append({"prompt_origin": prompt_text, "image_uri": None, "type": "generated_image"})
+            else:
+                logger.info(f"[{self.name}] {iteration_label}: Populating assets. URIs for this iter ({len(generated_uris_this_iter)}): {generated_uris_this_iter}. Prompts ({len(current_prompts_list_for_iter)}).")
+
             for idx, prompt_text in enumerate(current_prompts_list_for_iter):
                 asset_uri = generated_uris_this_iter[idx] if idx < len(generated_uris_this_iter) else None
+                logger.info(f"[{self.name}] {iteration_label}: For prompt '{prompt_text[:50]}...', derived URI: {asset_uri}")
+            
                 assets_for_critique_this_iteration.append({"prompt_origin": prompt_text, "image_uri": asset_uri, "type": "generated_image"})
                 if asset_uri:
+                    logger.info(f"[{self.name}] {iteration_label}: Appending to all_generated_assets_details_for_this_agent - URI: {asset_uri}, Prompt: '{prompt_text[:50]}...'")
                     all_generated_assets_details_for_this_agent.append({
                         "prompt_origin": prompt_text, "image_uri": asset_uri,
                         "type": "generated_image", "iteration": i + 1
@@ -477,6 +515,108 @@ class VisualAssetWorkflowAgent(BaseAgent):
         logger.info(f"[{self.name}] Total unique image assets in list: {len(all_image_assets_list)}")
         yield Event(author=self.name, content=types.Content(role="model", parts=[types.Part(text=f"Visual workflow complete. Static: {num_static}, Images: {num_generated_unique_images}, Videos: {num_videos}.")]))
 
+
+
+
+################################################################################
+# --- NEW CUSTOM AGENT - AudioProcessingPipelineAgent ---
+################################################################################
+class AudioProcessingPipelineAgent(BaseAgent):
+    model_config = {"arbitrary_types_allowed": True}
+    dialogue_to_speech_agent: LlmAgent
+    audio_to_timestamps_agent: LlmAgent
+
+    def __init__(self, name: str,
+                 dialogue_to_speech_agent: LlmAgent,
+                 audio_to_timestamps_agent: LlmAgent):
+        super().__init__(
+            name=name,
+            dialogue_to_speech_agent=dialogue_to_speech_agent,
+            audio_to_timestamps_agent=audio_to_timestamps_agent,
+            sub_agents=[dialogue_to_speech_agent, audio_to_timestamps_agent]
+        )
+
+    @override
+    async def _run_async_impl(self, ctx: InvocationContext) -> AsyncGenerator[Event, None]:
+        logger.info(f"[{self.name}] Starting audio processing pipeline.")
+        # Initialize outputs in session state
+        ctx.session.state["generated_dialogue_audio_uri"] = None
+        ctx.session.state["word_timestamps_list"] = []
+
+        current_recap = ctx.session.state.get("current_recap")
+        if not current_recap:
+            logger.warning(f"[{self.name}] 'current_recap' missing. Skipping audio processing.")
+            yield Event(author=self.name, content=types.Content(role="model", parts=[types.Part(text="Audio processing skipped: no recap.")]))
+            return
+
+        game_pk_for_audio = str(ctx.session.state.get("game_pk", "unknown_game"))
+        # Ensure game_pk is explicitly set for the DialogueToSpeechAgent if its instruction expects it directly
+        # However, the instruction above for DialogueToSpeechAgent says it will retrieve 'game_pk' from session state.
+
+        # 1. Generate Speech from Dialogue
+        logger.info(f"[{self.name}] Running DialogueToSpeechAgent for game_pk: {game_pk_for_audio}...")
+        async for event in self.dialogue_to_speech_agent.run_async(ctx):
+            yield event # Yield events from the sub-agent
+
+        raw_audio_details_json = ctx.session.state.get("generated_dialogue_audio_details_json", "{}")
+        # _clean_json_string_from_llm might not be necessary if the LlmAgent output_key directly gets the tool's JSON string
+        # but it's safer if the LLM ever wraps it.
+        cleaned_audio_details_json = _clean_json_string_from_llm(raw_audio_details_json, default_if_empty='{}')
+        
+        audio_uri = None
+        try:
+            audio_details = json.loads(cleaned_audio_details_json)
+            if isinstance(audio_details, dict):
+                if audio_details.get("error"):
+                    logger.error(f"[{self.name}] DialogueToSpeechAgent returned an error: {audio_details['error']}")
+                elif audio_details.get("audio_uri"):
+                    audio_uri = audio_details["audio_uri"]
+                    ctx.session.state["generated_dialogue_audio_uri"] = audio_uri
+                    logger.info(f"[{self.name}] Successfully generated dialogue audio: {audio_uri}")
+                else:
+                    logger.warning(f"[{self.name}] DialogueToSpeechAgent returned unexpected JSON: {audio_details}")
+            else:
+                logger.error(f"[{self.name}] DialogueToSpeechAgent output was not a JSON dict: {cleaned_audio_details_json}")
+
+        except json.JSONDecodeError as e:
+            logger.error(f"[{self.name}] Failed to parse JSON from DialogueToSpeechAgent. Error: {e}. JSON string: '{cleaned_audio_details_json}'")
+
+        # 2. Get Word Timestamps (if audio was generated)
+        if audio_uri:
+            logger.info(f"[{self.name}] Running AudioToTimestampsAgent for audio: {audio_uri}...")
+            # The AudioToTimestampsAgent's instruction tells it to pick up 'generated_dialogue_audio_uri' from state.
+            async for event in self.audio_to_timestamps_agent.run_async(ctx):
+                yield event
+
+            raw_timestamps_json = ctx.session.state.get("word_timestamps_json", "[]")
+            cleaned_timestamps_json = _clean_json_string_from_llm(raw_timestamps_json, default_if_empty='[]')
+            
+            try:
+                timestamps_data = json.loads(cleaned_timestamps_json)
+                if isinstance(timestamps_data, list):
+                    ctx.session.state["word_timestamps_list"] = timestamps_data
+                    logger.info(f"[{self.name}] Successfully retrieved {len(timestamps_data)} word timestamps.")
+                elif isinstance(timestamps_data, dict) and timestamps_data.get("error"):
+                    logger.error(f"[{self.name}] AudioToTimestampsAgent returned an error: {timestamps_data['error']}")
+                    ctx.session.state["word_timestamps_list"] = [] # Ensure it's a list for consistency
+                else:
+                    logger.warning(f"[{self.name}] AudioToTimestampsAgent returned unexpected JSON: {timestamps_data}")
+                    ctx.session.state["word_timestamps_list"] = []
+
+            except json.JSONDecodeError as e:
+                logger.error(f"[{self.name}] Failed to parse JSON from AudioToTimestampsAgent. Error: {e}. JSON string: '{cleaned_timestamps_json}'")
+                ctx.session.state["word_timestamps_list"] = []
+        else:
+            logger.warning(f"[{self.name}] Skipping timestamp generation as dialogue audio URI was not available.")
+            ctx.session.state["word_timestamps_list"] = []
+
+
+        final_message = f"Audio processing pipeline complete. Audio URI: {ctx.session.state['generated_dialogue_audio_uri']}, Timestamps found: {len(ctx.session.state.get('word_timestamps_list', []))}"
+        logger.info(f"[{self.name}] {final_message}")
+        yield Event(author=self.name, content=types.Content(role="model", parts=[types.Part(text=final_message)]))
+
+
+
 ################################################################################
 # --- GameRecapAgent Definition (Adjusted to use refactored VisualAssetWorkflowAgent) ---
 ################################################################################
@@ -491,6 +631,7 @@ class GameRecapAgent(BaseAgent):
     refinement_loop: LoopAgent
     post_processing_sequence: SequentialAgent
     visual_asset_workflow_orchestrator: VisualAssetWorkflowAgent # Changed variable name for clarity
+    audio_processing_pipeline_agent: AudioProcessingPipelineAgent
 
     def __init__(
         self,
@@ -502,6 +643,7 @@ class GameRecapAgent(BaseAgent):
         grammar_check: LlmAgent,
         tone_check: LlmAgent,
         visual_asset_workflow_orchestrator: VisualAssetWorkflowAgent, # Pass the orchestrator
+        audio_processing_pipeline_agent: AudioProcessingPipelineAgent,
     ):
         refinement_loop = LoopAgent(
             name="RecapRefinementLoop",
@@ -517,6 +659,7 @@ class GameRecapAgent(BaseAgent):
             refinement_loop,
             post_processing_sequence,
             visual_asset_workflow_orchestrator, # This is the refactored orchestrator
+            audio_processing_pipeline_agent,
         ]
         super().__init__(
             name=name,
@@ -529,6 +672,7 @@ class GameRecapAgent(BaseAgent):
             refinement_loop=refinement_loop,
             post_processing_sequence=post_processing_sequence,
             visual_asset_workflow_orchestrator=visual_asset_workflow_orchestrator,
+            audio_processing_pipeline_agent=audio_processing_pipeline_agent, 
             sub_agents=sub_agents_list
         )
 
@@ -593,7 +737,18 @@ class GameRecapAgent(BaseAgent):
         all_video_assets = ctx.session.state.get("all_video_assets_list", [])
         logger.info(f"[{self.name}] VisualAssetWorkflow Orchestrator finished. Images: {len(all_image_assets)}, Videos: {len(all_video_assets)}.")
 
-        # --- 3. Final Output Event for GameRecapAgent ---
+        # --- 3. Audio Processing Workflow (NEW) ---
+        if final_dialogue_recap: # Only run audio if dialogue exists
+            logger.info(f"[{self.name}] Running AudioProcessingPipelineAgent...")
+            async for event in self.audio_processing_pipeline_agent.run_async(ctx):
+                yield event
+            generated_audio_uri = ctx.session.state.get("generated_dialogue_audio_uri")
+            word_timestamps = ctx.session.state.get("word_timestamps_list", [])
+            logger.info(f"[{self.name}] AudioProcessingPipelineAgent finished. Audio URI: {generated_audio_uri}, Timestamps: {len(word_timestamps)}.")
+        else:
+            logger.warning(f"[{self.name}] Skipping Audio Processing as final dialogue recap is empty.")
+
+        # --- 4. Final Output Event for GameRecapAgent ---
         logger.info(f"[{self.name}] Yielding final dialogue recap.")
         yield Event(author=self.name, content=types.Content(role="model", parts=[types.Part(text=final_dialogue_recap)]))
         logger.info(f"[{self.name}] === GameRecapAgent processing complete. ===")
@@ -1199,6 +1354,50 @@ Your SOLE task is to execute the `video_clip_generator_mcp.generate_video_clips_
         output_key="generated_video_clips_uris_json", # JSON string list of video URIs
     )
 
+    # --- LlmAgents for the NEW AudioProcessingPipelineAgent ---
+    audio_processing_mcp_tools = loaded_mcp_tools.get("audio_processing_mcp", [])
+
+    dialogue_to_speech_agent = LlmAgent(
+        name="DialogueToSpeechAgent",
+        model=MODEL_ID, # Can be a simpler model if just calling a tool
+        instruction="""
+You are an audio synthesis coordinator.
+Expected in session state:
+- 'current_recap': The dialogue script text.
+- 'game_pk': The current game_pk (as a string or number).
+
+Your task:
+1. Retrieve the 'current_recap' string from session state.
+2. Retrieve the 'game_pk' from session state and ensure it's a string (e.g., "unknown_game" if not found).
+3. Call the `audio_processing_mcp.synthesize_multi_speaker_speech` tool with:
+    - `script` = the value from 'current_recap'.
+    - `game_pk_str` = the string game_pk.
+4. Your entire response MUST be ONLY the direct, verbatim JSON string output from the tool.
+   This JSON string will contain either an "audio_uri" or an "error".
+        """,
+        tools=audio_processing_mcp_tools,
+        output_key="generated_dialogue_audio_details_json", # e.g., '{"audio_uri": "gs://..."}' or '{"error": "..."}'
+    )
+
+    audio_to_timestamps_agent = LlmAgent(
+        name="AudioToTimestampsAgent",
+        model=MODEL_ID,
+        instruction="""
+You are an audio transcription analyst.
+Expected in session state:
+- 'generated_dialogue_audio_uri': A GCS URI string (e.g., "gs://bucket/audio.mp3") for the audio to be transcribed.
+
+Your task:
+1. Retrieve the 'generated_dialogue_audio_uri' string from session state.
+2. Call the `audio_processing_mcp.get_word_timestamps_from_audio` tool with:
+    - `audio_gcs_uri` = the value from 'generated_dialogue_audio_uri'.
+3. Your entire response MUST be ONLY the direct, verbatim JSON string output from the tool.
+   This JSON string will be a list of word timestamp objects or an error object.
+        """,
+        tools=audio_processing_mcp_tools,
+        output_key="word_timestamps_json", # e.g., '[{"word": "Hello", ...}]' or '{"error": "..."}'
+    )
+
     # --- Instantiate NEW Phase Agents ---
     static_asset_pipeline_agent_instance = StaticAssetPipelineAgent(
         name="StaticAssetPipeline",
@@ -1228,6 +1427,13 @@ Your SOLE task is to execute the `video_clip_generator_mcp.generate_video_clips_
         video_pipeline_agent=video_pipeline_agent_instance
     )
 
+    # --- Instantiate NEW AudioProcessingPipelineAgent ---
+    audio_processing_pipeline_agent_instance = AudioProcessingPipelineAgent(
+        name="AudioProcessingPipeline",
+        dialogue_to_speech_agent=dialogue_to_speech_agent,
+        audio_to_timestamps_agent=audio_to_timestamps_agent
+    )
+
     # --- Instantiate GameRecapAgent with the refactored Visual Orchestrator ---
     game_recap_assistant = GameRecapAgent(
         name="game_recap_assistant",
@@ -1238,6 +1444,7 @@ Your SOLE task is to execute the `video_clip_generator_mcp.generate_video_clips_
         grammar_check=grammar_check_agent,
         tone_check=tone_check_agent,
         visual_asset_workflow_orchestrator=visual_asset_workflow_orchestrator_instance,
+        audio_processing_pipeline_agent=audio_processing_pipeline_agent_instance,
     )
 
     root_agent = LlmAgent(
