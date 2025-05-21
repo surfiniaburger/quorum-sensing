@@ -3,7 +3,7 @@ name = "adk-multiagent-mcp-app"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = ">=3.13"
 dependencies = [
     "fastapi>=0.115.12",
     "geopy>=2.4.1",
@@ -15,8 +15,11 @@ dependencies = [
     "tavily-python>=0.5.4",
     "google-cloud-speech>=2.32.0",
     "moviepy>=2.1.2",
-    "pydub>=0.2.25.1",
+    "pydub>=0.25.1",
     "pandas>=2.2.3",
     "google-genai>=1.11.0",
     "db-dtypes>=1.4.3",
+    "google-cloud-texttospeech>=2.27.0",
+    "ffmpeg>=1.4",
+    "audioop-lts>=0.2.1",
 ]
