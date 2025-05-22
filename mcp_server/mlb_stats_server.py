@@ -355,7 +355,7 @@ async def get_team_schedule(team_identifier: str, days_range: int = 7) -> str:
 
     logger.info(f"MCP Tool: get_team_schedule for team_id={team_id} (from '{team_identifier}'), days_range={actual_days_range}")
 
-    today = datetime.utcnow().date()
+    today = datetime.now(UTC)
     if actual_days_range >= 0:
         start_date = today
         end_date = today + timedelta(days=actual_days_range)

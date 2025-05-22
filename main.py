@@ -569,10 +569,14 @@ class AudioProcessingPipelineAgent(BaseAgent):
             if isinstance(audio_details, dict):
                 if audio_details.get("error"):
                     logger.error(f"[{self.name}] DialogueToSpeechAgent returned an error: {audio_details['error']}")
-                elif audio_details.get("audio_uri"):
-                    audio_uri = audio_details["audio_uri"]
+                elif audio_details.get("uri"):
+                    audio_uri = audio_details["uri"]
                     ctx.session.state["generated_dialogue_audio_uri"] = audio_uri
                     logger.info(f"[{self.name}] Successfully generated dialogue audio: {audio_uri}")
+                elif audio_details.get("audio_uri"): # Keep this as a fallback just in case
+                    audio_uri = audio_details["audio_uri"] 
+                    ctx.session.state["generated_dialogue_audio_uri"] = audio_uri
+                    logger.info(f"[{self.name}] Successfully generated dialogue audio (using 'audio_uri' key): {audio_uri}")
                 else:
                     logger.warning(f"[{self.name}] DialogueToSpeechAgent returned unexpected JSON: {audio_details}")
             else:
@@ -799,7 +803,7 @@ async def _collect_tools_stack(
         # Ensure all expected keys exist, even if empty, for robust LlmAgent tool access
         expected_tool_keys = ["weather", "bnb", "ct", "mlb", "web_search", "bq_search", 
                               "visual_assets", "static_retriever_mcp", 
-                              "image_embedding_mcp", "video_clip_generator_mcp"]
+                              "image_embedding_mcp", "video_clip_generator_mcp", "audio_processing_mcp"]
         for k in expected_tool_keys:
             if k not in all_tools:
                 logging.info("Tools for key '%s' were not collected. Ensuring key exists with empty list.", k)
@@ -1306,26 +1310,40 @@ Output ONLY a JSON list string.
         name="VeoPromptGenerator",
         model=GEMINI_PRO_MODEL_ID, # Needs good reasoning capability
         instruction="""
-You are a creative video director planning dynamic shots for an MLB highlight reel using Veo text-to-video.
+You are a creative video director planning concise and compelling video shots for an MLB highlight reel using a text-to-video model like Veo, which generates short clips (approximately 5-8 seconds). Your prompts must be safe and adhere to common content guidelines.
+
 Expected in session state:
 - 'current_recap': The final dialogue script for the game.
-- 'visual_critique_text' (Optional): Critique from the *image* generation phase. This might offer clues about visual gaps or important moments that images didn't fully capture.
-- 'final_static_assets_list' (Optional): List of retrieved static assets (logos, headshots).
-- 'current_all_generated_visual_uris_list' (Optional): List of URIs from the image generation phase.
+- 'visual_critique_text' (Optional): Critique from the *image* generation phase.
+- 'all_image_assets_list' (Optional): List of all image assets (static and generated so far). This includes dicts with 'image_uri' and 'type'.
+- 'all_video_assets_list' (Optional): List of video assets generated so far.
 
 Your Task:
-1.  Review the 'current_recap' to identify 2-3 key *action-packed moments* or significant narrative points that would be best represented by a short video clip (e.g., a game-winning hit, a spectacular defensive play, a key strikeout, a strong fan reaction, a pitcher's full windup and delivery for a critical pitch).
-2.  Consider the 'visual_critique_text'. If it highlighted actions that static images failed to capture well, prioritize those for video prompts.
-3.  Avoid duplicating visuals if static or generated images already cover a moment adequately, unless video would add significant dynamism.
-4.  For each selected moment, generate a concise, descriptive, and DYNAMIC prompt suitable for Veo text-to-video.
-    - Focus on ACTION, MOTION, and CAMERA WORK (e.g., "slow-motion shot of batter connecting...", "dynamic tracking shot of a runner sliding...", "close-up on pitcher's intense face during windup, then delivering the pitch").
-    - Adhere to safety rules: NO specific player names, NO specific team names. Use generic descriptions like "an MLB player," "the home team batter," "a fielder in a blue uniform."
-    - Keep prompts to a reasonable length for Veo.
+1.  **Review 'current_recap'**: Identify 2-3 distinct, key moments suitable for short video clips.
+    *   **Prioritize single, impactful actions or brief sequences** that can be fully conveyed in 5-8 seconds (e.g., a pitch and swing, a diving catch, a runner sliding, a batter's reaction, a brief fan celebration).
+    *   Avoid overly complex sequences that require more time (e.g., a full at-bat with multiple pitches, a long running play with multiple parts).
+2.  **Consider Existing Visuals**:
+    *   Review 'all_image_assets_list' and 'all_video_assets_list'.
+    *   **Avoid Duplication**: Do not generate prompts for moments already well-covered by existing high-quality images or videos, unless a video clip would add *significant unique dynamism or a different perspective* not possible with a static image.
+    *   **Complement, Don't Repeat**: If an image shows the *result* of an action (e.g., player celebrating after a hit), a video might show the *action itself* (e.g., the swing connecting).
+3.  **Generate Veo-Optimized Prompts (2-3 prompts maximum):**
+    *   **Conciseness for Time**: Each prompt should describe a scene or action that can realistically unfold in about 5-8 seconds.
+    *   **Focus and Clarity**: Target one primary subject and action per prompt.
+    *   **Dynamic but Safe Language**:
+        *   Emphasize motion, camera work (e.g., "slow-motion of...", "dynamic low-angle shot of...", "close-up tracking..."), and visual details.
+        *   Describe sports actions factually and visually (e.g., "batter swings and connects with the baseball," "fielder dives to catch the ball," "runner slides into the base").
+        *   **AVOID**: Overly aggressive or potentially misinterpretable "action" words if they could trigger safety filters (e.g., instead of "batter crushes the ball," try "batter hits a long fly ball"). Be mindful of terms that might imply harm even in a sports context. Focus on the athleticism and skill.
+    *   **Adherence to Safety Rules (Strictly Enforced by Veo):**
+        *   **NO specific player names.**
+        *   **NO specific team names.**
+        *   Use generic descriptions: "an MLB player," "the home team batter," "a fielder in a blue uniform," "a pitcher in a gray away jersey."
+    *   **Prompt Length**: Keep prompts reasonably short and to the point.
 
 Output ONLY a JSON list of 2-3 Veo prompt strings, formatted AS A JSON STRING.
 Example Output (as a string):
-"[\\"Dynamic low-angle shot of an MLB batter in a white home uniform hitting a walk-off home run, bat flip, teammates rushing out of the dugout to celebrate.\\", \\"Slow-motion close-up of a baseball hitting the sweet spot of a bat, a spray of dirt kicking up from home plate.\\"]"
-If no highly suitable moments for video are identified, or if the recap is very short, output an empty JSON list string: "[]".
+"[\\"Slow-motion close-up of a baseball hitting the sweet spot of a wooden bat, a spray of dirt kicking up from home plate.\\", \\"Dynamic low-angle shot of an MLB batter in a white home uniform making contact and watching the ball fly, stadium lights in the background.\\", \\"A fielder in a blue uniform makes a diving catch on a line drive in the outfield grass.\\"]"
+
+If no highly suitable moments for distinct, short video clips are identified (considering existing visuals and time constraints), or if the recap is very short, output an empty JSON list string: "[]".
         """,
         # No tools needed for this agent, it just generates prompts
         output_key="veo_generation_prompts_json", # JSON string list of prompts for Veo
@@ -1361,19 +1379,14 @@ Your SOLE task is to execute the `video_clip_generator_mcp.generate_video_clips_
         name="DialogueToSpeechAgent",
         model=MODEL_ID, # Can be a simpler model if just calling a tool
         instruction="""
-You are an audio synthesis coordinator.
-Expected in session state:
-- 'current_recap': The dialogue script text.
-- 'game_pk': The current game_pk (as a string or number).
-
-Your task:
-1. Retrieve the 'current_recap' string from session state.
-2. Retrieve the 'game_pk' from session state and ensure it's a string (e.g., "unknown_game" if not found).
-3. Call the `audio_processing_mcp.synthesize_multi_speaker_speech` tool with:
-    - `script` = the value from 'current_recap'.
-    - `game_pk_str` = the string game_pk.
-4. Your entire response MUST be ONLY the direct, verbatim JSON string output from the tool.
-   This JSON string will contain either an "audio_uri" or an "error".
+You are an audio synthesis coordination robot.
+You will receive 'current_recap' (a string of dialogue) and 'game_pk' (a string) from session state.
+Your ONLY task is to call the audio_processing_mcp.synthesize_multi_speaker_speech tool.
+For the tool's script parameter, use the value of 'current_recap'.
+For the tool's game_pk_str parameter, use the value of 'game_pk'.
+After the audio_processing_mcp.synthesize_multi_speaker_speech tool executes, it will return a JSON string.
+Your final response MUST be this exact, verbatim JSON string that the tool provided.
+Do not add any other text, explanation, or formatting. Do not confirm the inputs. Your output is solely the tool's direct JSON output.
         """,
         tools=audio_processing_mcp_tools,
         output_key="generated_dialogue_audio_details_json", # e.g., '{"audio_uri": "gs://..."}' or '{"error": "..."}'
