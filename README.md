@@ -127,7 +127,7 @@ The application should now be accessible, typically at <http://127.0.0.1:8000>.
 
 ## **4. Deploying to Cloud Run**
 
-Follow these steps to build and deploy the application as a containerized service on Google Cloud Run.
+Follow these steps to build and deploy the application as a containerized service on Google Cloud Run. 
 
 Set Environment Variables for Deployment
 
@@ -174,13 +174,3 @@ A voice-controlled video generator
 
 The agent is demonstrating learning, adaptation, and a more sophisticated research process.
 
-
-
-
-'s been swinging a hot bat since last week!\n\nHost B: Don't forget Goldschmidt driving in a run too in that same inning. Big boost for the offense.", "critique_embedding": null, "timestamp": "2025-05-19T23:06:28.180229+00:00"}
-2025-05-20 00:06:28,180 - INFO - bq_vector_search_mcp - BQ_MCP: Inserting 1 rows into silver-455021.mlb_rag_data_2024.agent_critiques...
-2025-05-20 00:06:29,053 - ERROR - bq_vector_search_mcp - BQ_MCP: Errors occurred during BQ insertion into silver-455021.mlb_rag_data_2024.agent_critiques: [{'index': 0, 'errors': [{'reason': 'invalid', 'location': 'critique_embedding', 'debugInfo': '', 'message': 'Field value of critique_embedding cannot be empty.'}]}]
-2025-05-20 00:06:29,053 - ERROR - bq_vector_search_mcp - BQ_MCP: store_new_critique - BQ client reported errors storing critique for task hash cfefd02e53c91c14310833498328ec30aaaed12a9bf2d7c5e34c61b2a1f64772 (game_pk: 777878).
-2025-05-20 00:06:29,068 - INFO - Processing request of type CallToolRequest
-2025-05-20 00:06:29,070 - INFO - WEB_SEARCH_MCP: perform_web_search - Query: 'Cody Bellinger grand slam distance May 18 2025 Yankees Mets', MaxResults: 1
-2025-05-20 00:06:29,070 - INFO - Performing Tavily search for: 'Cody Bellinger grand sl
