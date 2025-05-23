@@ -35,7 +35,7 @@ load_dotenv()
 
 APP_NAME = "ADK_MCP_App_Updated" # Changed to avoid potential conflicts if old app is running
 MODEL_ID = "gemini-2.0-flash" # Updated to a generally available model, ensure you have access
-GEMINI_PRO_MODEL_ID = "gemini-2.5-flash-preview-04-17" # For potentially more complex tasks like generation/revision
+GEMINI_PRO_MODEL_ID = "gemini-2.5-pro-preview-05-06" # For potentially more complex tasks like generation/revision
 
 STATIC_DIR = "static"
 
@@ -563,22 +563,20 @@ class AudioProcessingPipelineAgent(BaseAgent):
         # but it's safer if the LLM ever wraps it.
         cleaned_audio_details_json = _clean_json_string_from_llm(raw_audio_details_json, default_if_empty='{}')
         
-        audio_uri = None
+        audio_uri_for_stt = None 
         try:
             audio_details = json.loads(cleaned_audio_details_json)
             if isinstance(audio_details, dict):
                 if audio_details.get("error"):
                     logger.error(f"[{self.name}] DialogueToSpeechAgent returned an error: {audio_details['error']}")
-                elif audio_details.get("uri"):
-                    audio_uri = audio_details["uri"]
-                    ctx.session.state["generated_dialogue_audio_uri"] = audio_uri
-                    logger.info(f"[{self.name}] Successfully generated dialogue audio: {audio_uri}")
-                elif audio_details.get("audio_uri"): # Keep this as a fallback just in case
-                    audio_uri = audio_details["audio_uri"] 
-                    ctx.session.state["generated_dialogue_audio_uri"] = audio_uri
-                    logger.info(f"[{self.name}] Successfully generated dialogue audio (using 'audio_uri' key): {audio_uri}")
-                else:
-                    logger.warning(f"[{self.name}] DialogueToSpeechAgent returned unexpected JSON: {audio_details}")
+                else:    
+                    potential_uri = audio_details.get("uri") or audio_details.get("audio_uri")
+                    if potential_uri and isinstance(potential_uri, str) and potential_uri.startswith("gs://"):
+                        audio_uri_for_stt = potential_uri
+                        ctx.session.state["generated_dialogue_audio_uri"] = audio_uri_for_stt # Keep original key for other uses if any
+                        logger.info(f"[{self.name}] Valid GCS URI for STT: {audio_uri_for_stt}")
+                    else: 
+                        logger.warning(f"[{self.name}] DialogueToSpeechAgent returned JSON with missing or invalid GCS URI: {audio_details}. Potential URI was: '{potential_uri}'")
             else:
                 logger.error(f"[{self.name}] DialogueToSpeechAgent output was not a JSON dict: {cleaned_audio_details_json}")
 
@@ -586,8 +584,8 @@ class AudioProcessingPipelineAgent(BaseAgent):
             logger.error(f"[{self.name}] Failed to parse JSON from DialogueToSpeechAgent. Error: {e}. JSON string: '{cleaned_audio_details_json}'")
 
         # 2. Get Word Timestamps (if audio was generated)
-        if audio_uri:
-            logger.info(f"[{self.name}] Running AudioToTimestampsAgent for audio: {audio_uri}...")
+        if audio_uri_for_stt:
+            logger.info(f"[{self.name}] Running AudioToTimestampsAgent for audio: {audio_uri_for_stt}...")
             # The AudioToTimestampsAgent's instruction tells it to pick up 'generated_dialogue_audio_uri' from state.
             async for event in self.audio_to_timestamps_agent.run_async(ctx):
                 yield event
@@ -620,6 +618,124 @@ class AudioProcessingPipelineAgent(BaseAgent):
         yield Event(author=self.name, content=types.Content(role="model", parts=[types.Part(text=final_message)]))
 
 
+################################################################################
+# --- AssetValidationAndRetryAgent Definition ---
+################################################################################
+class AssetValidationAndRetryAgent(BaseAgent):
+    model_config = {"arbitrary_types_allowed": True}
+    static_asset_pipeline_agent: StaticAssetPipelineAgent
+    iterative_image_generation_agent: IterativeImageGenerationAgent
+    video_pipeline_agent: VideoPipelineAgent
+    audio_processing_pipeline_agent: AudioProcessingPipelineAgent
+    max_retries_per_pipeline: int
+
+    def __init__(self, name: str,
+                 static_asset_pipeline_agent: StaticAssetPipelineAgent,
+                 iterative_image_generation_agent: IterativeImageGenerationAgent,
+                 video_pipeline_agent: VideoPipelineAgent,
+                 audio_processing_pipeline_agent: AudioProcessingPipelineAgent,
+                 max_retries_per_pipeline: int = 1):
+        super().__init__(
+            name=name,
+            # These are Pydantic fields for the agent's configuration/state
+            static_asset_pipeline_agent=static_asset_pipeline_agent,
+            iterative_image_generation_agent=iterative_image_generation_agent,
+            video_pipeline_agent=video_pipeline_agent,
+            audio_processing_pipeline_agent=audio_processing_pipeline_agent,
+            max_retries_per_pipeline=max_retries_per_pipeline,
+            # AssetValidationAndRetryAgent itself does not have exclusive sub-components
+            # that are not already parented elsewhere. The agents it interacts with
+            # are referenced via its fields but are not its children in the ADK agent tree.
+            sub_agents=[]
+        )
+        # Store references to the agents it will manage/retry.
+        # Pydantic already handles setting these as attributes if they are defined
+        # in the class and passed to super().__init__(**kwargs).
+        # Explicit assignment here is fine for clarity or if BaseAgent doesn't assign all kwargs.
+        self.static_asset_pipeline_agent = static_asset_pipeline_agent
+        self.iterative_image_generation_agent = iterative_image_generation_agent
+        self.video_pipeline_agent = video_pipeline_agent
+        self.audio_processing_pipeline_agent = audio_processing_pipeline_agent
+        # self.max_retries_per_pipeline is already set by Pydantic
+    
+    # ... (rest of AssetValidationAndRetryAgent._run_async_impl method remains the same)
+    async def _run_async_impl(self, ctx: InvocationContext) -> AsyncGenerator[Event, None]:
+        logger.info(f"[{self.name}] Starting asset validation and retry process.")
+        
+        if "asset_retry_counts" not in ctx.session.state:
+            ctx.session.state["asset_retry_counts"] = {
+                "static": 0, "image_gen": 0, "video_gen": 0, "audio_gen": 0
+            }
+        retry_counts = ctx.session.state["asset_retry_counts"]
+
+        if not ctx.session.state.get("current_recap"):
+            logger.warning(f"[{self.name}] No current_recap. Skipping validation.")
+            yield Event(author=self.name, content=types.Content(role="model", parts=[types.Part(text="Asset validation skipped: no recap.")]))
+            return
+
+        # --- Static Assets Validation & Retry ---
+        static_assets = ctx.session.state.get("current_static_assets_list", [])
+        if not static_assets and retry_counts["static"] < self.max_retries_per_pipeline:
+            logger.warning(f"[{self.name}] Static assets missing. Retrying (attempt {retry_counts['static'] + 1}).")
+            retry_counts["static"] += 1
+            ctx.session.state["current_static_assets_list"] = [] # Clear previous
+            async for event in self.static_asset_pipeline_agent.run_async(ctx): yield event
+            logger.info(f"[{self.name}] Static assets retry complete. Found: {len(ctx.session.state.get('current_static_assets_list', []))}")
+        elif not static_assets:
+            logger.warning(f"[{self.name}] Static assets still missing after max retries.")
+
+        # --- Generated Images Validation & Retry ---
+        generated_images = ctx.session.state.get("all_generated_image_assets_details", [])
+        if not generated_images and retry_counts["image_gen"] < self.max_retries_per_pipeline:
+            logger.warning(f"[{self.name}] Generated images missing. Retrying (attempt {retry_counts['image_gen'] + 1}).")
+            retry_counts["image_gen"] += 1
+            ctx.session.state["all_generated_image_assets_details"] = [] # Clear previous
+            async for event in self.iterative_image_generation_agent.run_async(ctx): yield event
+            logger.info(f"[{self.name}] Generated images retry complete. Found: {len(ctx.session.state.get('all_generated_image_assets_details', []))}")
+        elif not generated_images:
+            logger.warning(f"[{self.name}] Generated images still missing after max retries.")
+
+        # --- Video Clips Validation & Retry ---
+        generated_videos = ctx.session.state.get("final_video_assets_list", [])
+        if not generated_videos and retry_counts["video_gen"] < self.max_retries_per_pipeline:
+            logger.warning(f"[{self.name}] Generated videos missing. Retrying (attempt {retry_counts['video_gen'] + 1}).")
+            retry_counts["video_gen"] += 1
+            ctx.session.state["final_video_assets_list"] = [] # Clear previous
+            async for event in self.video_pipeline_agent.run_async(ctx): yield event
+            logger.info(f"[{self.name}] Generated videos retry complete. Found: {len(ctx.session.state.get('final_video_assets_list', []))}")
+        elif not generated_videos:
+             logger.warning(f"[{self.name}] Generated videos still missing after max retries.")
+
+        # --- Audio Processing Validation & Retry ---
+        if hasattr(self, 'audio_processing_pipeline_agent') and self.audio_processing_pipeline_agent:
+            generated_audio = ctx.session.state.get("generated_dialogue_audio_uri")
+            if not generated_audio and retry_counts["audio_gen"] < self.max_retries_per_pipeline:
+                logger.warning(f"[{self.name}] Generated audio missing. Retrying (attempt {retry_counts['audio_gen'] + 1}).")
+                retry_counts["audio_gen"] += 1
+                ctx.session.state["generated_dialogue_audio_uri"] = None 
+                ctx.session.state["word_timestamps_list"] = []
+                async for event in self.audio_processing_pipeline_agent.run_async(ctx): yield event
+                logger.info(f"[{self.name}] Generated audio retry complete. URI: {ctx.session.state.get('generated_dialogue_audio_uri')}")
+            elif not generated_audio:
+                 logger.warning(f"[{self.name}] Generated audio still missing after max retries.")
+        else:
+            logger.info(f"[{self.name}] Audio processing pipeline agent not available for validation/retry.")
+
+
+        ctx.session.state["asset_retry_counts"] = retry_counts 
+
+        current_static_assets = ctx.session.state.get("current_static_assets_list", [])
+        all_generated_image_details = ctx.session.state.get("all_generated_image_assets_details", [])
+        final_generated_visuals_dict = {}
+        for asset in sorted(all_generated_image_details, key=lambda x: x.get("iteration", 0)):
+            if asset.get("image_uri"):
+                final_generated_visuals_dict[asset["image_uri"]] = asset
+        ctx.session.state["all_image_assets_list"] = current_static_assets + list(final_generated_visuals_dict.values())
+        
+        logger.info(f"[{self.name}] Asset validation and retry process finished.")
+        yield Event(author=self.name, content=types.Content(role="model", parts=[types.Part(text="Asset validation and retry efforts complete.")]))
+
+
 
 ################################################################################
 # --- GameRecapAgent Definition (Adjusted to use refactored VisualAssetWorkflowAgent) ---
@@ -636,6 +752,7 @@ class GameRecapAgent(BaseAgent):
     post_processing_sequence: SequentialAgent
     visual_asset_workflow_orchestrator: VisualAssetWorkflowAgent # Changed variable name for clarity
     audio_processing_pipeline_agent: AudioProcessingPipelineAgent
+    asset_validator: AssetValidationAndRetryAgent 
 
     def __init__(
         self,
@@ -658,12 +775,22 @@ class GameRecapAgent(BaseAgent):
             name="RecapPostProcessing",
             sub_agents=[grammar_check, tone_check]
         )
+        
+        asset_validator_instance = AssetValidationAndRetryAgent(
+            name="AssetValidationAndRetry",
+            static_asset_pipeline_agent=visual_asset_workflow_orchestrator.static_asset_pipeline_agent,
+            iterative_image_generation_agent=visual_asset_workflow_orchestrator.iterative_image_generation_agent,
+            video_pipeline_agent=visual_asset_workflow_orchestrator.video_pipeline_agent,
+            audio_processing_pipeline_agent=audio_processing_pipeline_agent, # Pass the audio agent instance
+            max_retries_per_pipeline=1 # Set desired max retries, 0 to disable
+)
         sub_agents_list = [
             initial_recap_generator,
             refinement_loop,
             post_processing_sequence,
             visual_asset_workflow_orchestrator, # This is the refactored orchestrator
             audio_processing_pipeline_agent,
+            asset_validator_instance,
         ]
         super().__init__(
             name=name,
@@ -677,7 +804,8 @@ class GameRecapAgent(BaseAgent):
             post_processing_sequence=post_processing_sequence,
             visual_asset_workflow_orchestrator=visual_asset_workflow_orchestrator,
             audio_processing_pipeline_agent=audio_processing_pipeline_agent, 
-            sub_agents=sub_agents_list
+            sub_agents=sub_agents_list,
+            asset_validator=asset_validator_instance,
         )
 
     @override
@@ -751,6 +879,27 @@ class GameRecapAgent(BaseAgent):
             logger.info(f"[{self.name}] AudioProcessingPipelineAgent finished. Audio URI: {generated_audio_uri}, Timestamps: {len(word_timestamps)}.")
         else:
             logger.warning(f"[{self.name}] Skipping Audio Processing as final dialogue recap is empty.")
+
+        # --- Asset Validation and Retry Step ---
+        if self.asset_validator.max_retries_per_pipeline > 0: # Conditionally run
+           logger.info(f"[{self.name}] Running AssetValidationAndRetryAgent...")
+           async for event in self.asset_validator.run_async(ctx):
+              yield event
+           logger.info(f"[{self.name}] AssetValidationAndRetryAgent finished.")
+           # The session state (component asset lists and all_image_assets_list)
+           # will be updated by the AssetValidationAndRetryAgent.
+        
+        # --- Update Final Asset Counts for Logging (using the potentially updated lists) ---
+        all_image_assets = ctx.session.state.get("all_image_assets_list", [])
+        all_video_assets = ctx.session.state.get("all_video_assets_list", [])
+        # Potentially log other asset counts like static, generated images separately if needed
+        num_static = len(ctx.session.state.get("current_static_assets_list", []))
+        num_generated_unique_images = len(ctx.session.state.get("all_generated_image_assets_details", [])) # Or derive from all_image_assets
+        num_videos = len(all_video_assets)
+        generated_audio_uri = ctx.session.state.get("generated_dialogue_audio_uri")
+        word_timestamps = ctx.session.state.get("word_timestamps_list", [])
+
+        logger.info(f"[{self.name}] Post-Validation - Static: {num_static}, Gen.Images: {num_generated_unique_images}, Videos: {num_videos}, Audio: {'Yes' if generated_audio_uri else 'No'}, Timestamps: {len(word_timestamps)}")
 
         # --- 4. Final Output Event for GameRecapAgent ---
         logger.info(f"[{self.name}] Yielding final dialogue recap.")
@@ -1381,12 +1530,13 @@ Your SOLE task is to execute the `video_clip_generator_mcp.generate_video_clips_
         instruction="""
 You are an audio synthesis coordination robot.
 You will receive 'current_recap' (a string of dialogue) and 'game_pk' (a string) from session state.
-Your ONLY task is to call the audio_processing_mcp.synthesize_multi_speaker_speech tool.
-For the tool's script parameter, use the value of 'current_recap'.
-For the tool's game_pk_str parameter, use the value of 'game_pk'.
-After the audio_processing_mcp.synthesize_multi_speaker_speech tool executes, it will return a JSON string.
-Your final response MUST be this exact, verbatim JSON string that the tool provided.
-Do not add any other text, explanation, or formatting. Do not confirm the inputs. Your output is solely the tool's direct JSON output.
+Your ONLY task is to call the `audio_processing_mcp.synthesize_multi_speaker_speech` tool.
+For the tool's `script` parameter, use the value of 'current_recap'.
+For the tool's `game_pk_str` parameter, use the value of 'game_pk'.
+The tool is expected to return a JSON string containing an 'audio_uri' which MUST be a full GCS URI (e.g., "gs://bucket-name/path/to/audio.mp3").
+If the tool call is successful and returns a valid JSON with a 'gs://' URI, your final response MUST be this exact, verbatim JSON string from the tool.
+If the tool call fails, or if the returned 'audio_uri' is not a valid GCS URI (does not start with 'gs://'), or if the tool returns an error structure, you MUST output a JSON string in the format: `{"error": "Descriptive error message about TTS failure or invalid URI"}`.
+Do not add any other text, explanation, or formatting.
         """,
         tools=audio_processing_mcp_tools,
         output_key="generated_dialogue_audio_details_json", # e.g., '{"audio_uri": "gs://..."}' or '{"error": "..."}'
@@ -1402,10 +1552,14 @@ Expected in session state:
 
 Your task:
 1. Retrieve the 'generated_dialogue_audio_uri' string from session state.
-2. Call the `audio_processing_mcp.get_word_timestamps_from_audio` tool with:
+2. **Validate Input:** Check if 'generated_dialogue_audio_uri' starts with "gs://".
+   - If it does not start with "gs://", or is missing/empty, you MUST immediately output the JSON string: `{"error": "Invalid or missing audio GCS URI provided for transcription. Expected gs:// path."}`. Do NOT proceed to call any tool.
+3. **Call Tool (if input is valid):** If the URI is valid, call the `audio_processing_mcp.get_word_timestamps_from_audio` tool with:
     - `audio_gcs_uri` = the value from 'generated_dialogue_audio_uri'.
-3. Your entire response MUST be ONLY the direct, verbatim JSON string output from the tool.
-   This JSON string will be a list of word timestamp objects or an error object.
+4. **Handle Tool Output:**
+   - If the tool call is successful, it will return a JSON string representing a list of word timestamp objects. Your entire response MUST be ONLY this direct, verbatim JSON string from the tool.
+   - If the tool call itself returns a JSON string indicating an error (e.g., `{"error": "STT tool failed"}`), your response MUST be that exact error JSON string.
+   - If the tool call fails for any other reason before returning a JSON string, you MUST output: `{"error": "Failed to execute the STT tool or received unexpected non-JSON response."}`.
         """,
         tools=audio_processing_mcp_tools,
         output_key="word_timestamps_json", # e.g., '[{"word": "Hello", ...}]' or '{"error": "..."}'
