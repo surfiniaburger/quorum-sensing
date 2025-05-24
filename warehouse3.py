@@ -146,205 +146,163 @@ def _clean_json_string_from_llm(raw_json_string: Optional[str], default_if_empty
     return clean_string.strip() if clean_string.strip() else default_if_empty
 
 ################################################################################
-# --- REFACTORED StaticAssetPipelineAgent (Parses boxscore for player map) ---
+# --- PHASE 1: REFACTORED StaticAssetPipelineAgent (Python-driven retrieval loop) ---
 ################################################################################
 class StaticAssetPipelineAgent(BaseAgent):
     model_config = {"arbitrary_types_allowed": True}
     entity_extractor: LlmAgent
     static_asset_query_generator: LlmAgent
-    logo_searcher_llm: LlmAgent
-    headshot_retriever_llm: LlmAgent
+    logo_searcher_llm: LlmAgent         # New
+    headshot_retriever_llm: LlmAgent    # New
 
     def __init__(self, name: str,
                  entity_extractor: LlmAgent,
                  static_asset_query_generator: LlmAgent,
-                 logo_searcher_llm: LlmAgent,
-                 headshot_retriever_llm: LlmAgent):
+                 logo_searcher_llm: LlmAgent,         # New
+                 headshot_retriever_llm: LlmAgent):   # New
         super().__init__(
             name=name,
             entity_extractor=entity_extractor,
             static_asset_query_generator=static_asset_query_generator,
             logo_searcher_llm=logo_searcher_llm,
             headshot_retriever_llm=headshot_retriever_llm,
-            sub_agents=[
+            sub_agents=[ # These are the agents this orchestrator will call
                 entity_extractor, 
                 static_asset_query_generator, 
                 logo_searcher_llm, 
                 headshot_retriever_llm
             ]
         )
+        # Pydantic handles attribute assignment
 
     def _extract_team_name_from_query(self, query_string: str) -> Optional[str]:
+        # A more robust extraction might be needed depending on query_string variations
         query_lower = query_string.lower()
-        if " logo" in query_lower: return query_lower.replace(" logo", "").strip().title()
+        if " logo" in query_lower:
+            # Attempt to remove " logo" and common leading/trailing articles/words if any
+            team_name = query_lower.replace(" logo", "").strip()
+            # Basic title case, could be improved with a proper NLU library for complex names
+            return ' '.join(word.capitalize() for word in team_name.split())
         return None
 
     def _extract_player_name_from_query(self, query_string: str) -> Optional[str]:
         query_lower = query_string.lower()
-        if " headshot" in query_lower: return query_lower.replace(" headshot", "").strip().title()
+        if " headshot" in query_lower:
+            player_name = query_lower.replace(" headshot", "").strip()
+            return ' '.join(word.capitalize() for word in player_name.split())
         return None
-
-    def _build_player_maps_from_boxscore(self, boxscore_json_str: str) -> Tuple[Dict[str,str], Dict[str,str]]:
-        """
-        Parses the boxscore JSON string to build player ID-to-Name and Name-to-ID maps.
-        This function needs to be adapted based on the actual structure of your
-        mlb_stats.get_game_boxscore_and_details tool's output.
-        """
-        player_id_to_name_map = {}
-        player_name_to_id_map_lower = {}
-        
-        if not boxscore_json_str:
-            logger.warning(f"[{self.name}] Boxscore JSON string is empty. Cannot build player maps.")
-            return player_id_to_name_map, player_name_to_id_map_lower
-
-        try:
-            boxscore_data = json.loads(boxscore_json_str)
-            if not isinstance(boxscore_data, dict):
-                logger.error(f"[{self.name}] Parsed boxscore_data is not a dictionary.")
-                return player_id_to_name_map, player_name_to_id_map_lower
-
-            # --- ADAPT THIS SECTION BASED ON YOUR TOOL'S JSON STRUCTURE ---
-            # Example: Assuming boxscore_data has 'teams.home.players' and 'teams.away.players'
-            # each being a dictionary of player_id -> player_object
-            # And each player_object has 'id' and 'fullName' or similar.
-
-            def process_team_players(players_data: Optional[Dict]):
-                if isinstance(players_data, dict):
-                    for player_id_from_key, player_obj in players_data.items():
-                        if isinstance(player_obj, dict):
-                            player_id = str(player_obj.get("id", player_id_from_key)) # Prefer "id" field if present
-                            full_name = player_obj.get("fullName") # Or "person.fullName", "name_display_first_last", etc.
-                            
-                            if player_id and full_name:
-                                player_id_str = str(player_id)
-                                full_name_str = str(full_name).strip()
-                                if player_id_str not in player_id_to_name_map: # Avoid overwriting, first found wins
-                                     player_id_to_name_map[player_id_str] = full_name_str
-                                player_name_to_id_map_lower[full_name_str.lower()] = player_id_str
-            
-            # Hypothetical structure:
-            if "teams" in boxscore_data and isinstance(boxscore_data["teams"], dict):
-                if "home" in boxscore_data["teams"] and isinstance(boxscore_data["teams"]["home"], dict):
-                    process_team_players(boxscore_data["teams"]["home"].get("players"))
-                if "away" in boxscore_data["teams"] and isinstance(boxscore_data["teams"]["away"], dict):
-                    process_team_players(boxscore_data["teams"]["away"].get("players"))
-            
-            # Alternative: A flat list of all players might be somewhere
-            # elif "allPlayers" in boxscore_data and isinstance(boxscore_data["allPlayers"], list):
-            #     for player_obj in boxscore_data["allPlayers"]:
-            #         if isinstance(player_obj, dict):
-            #             player_id = str(player_obj.get("id"))
-            #             full_name = player_obj.get("fullName")
-            #             if player_id and full_name: # ... add to maps ...
-
-            if not player_id_to_name_map:
-                 logger.warning(f"[{self.name}] No player data could be extracted from boxscore structure.")
-            # --- END OF ADAPTATION SECTION ---
-
-        except json.JSONDecodeError as e:
-            logger.error(f"[{self.name}] Failed to parse boxscore_details_json_str: {e}. String was: {boxscore_json_str[:500]}")
-        except Exception as e:
-            logger.error(f"[{self.name}] Error building player maps from boxscore: {e}", exc_info=True)
-            
-        logger.info(f"[{self.name}] Built player_id_to_name_map (size {len(player_id_to_name_map)}) from boxscore.")
-        logger.info(f"[{self.name}] Built player_name_to_id_map_lower (size {len(player_name_to_id_map_lower)}). Sample: {list(player_name_to_id_map_lower.items())[:3]}")
-        return player_id_to_name_map, player_name_to_id_map_lower
 
     @override
     async def _run_async_impl(self, ctx: InvocationContext) -> AsyncGenerator[Event, None]:
-        logger.info(f"[{self.name}] Starting REFACTORED static asset pipeline (with Python player map parsing).")
-        ctx.session.state["current_static_assets_list"] = []
+        logger.info(f"[{self.name}] Starting REFACTORED static asset retrieval pipeline.")
+        ctx.session.state["current_static_assets_list"] = [] # Initialize output
 
-        # Ensure recap and boxscore details are present
         current_recap = ctx.session.state.get("current_recap")
-        boxscore_details_json_str = ctx.session.state.get("boxscore_details_json_str")
-
-        if not current_recap: # ... (handle missing recap)
-            logger.warning(f"[{self.name}] 'current_recap' missing. Skipping.")
-            yield Event(author=self.name, content=types.Content(role="model",parts=[types.Part(text="Static asset pipeline skipped: no recap.")]))
-            return
-        if not boxscore_details_json_str:
-            logger.warning(f"[{self.name}] 'boxscore_details_json_str' missing. Cannot build player maps. Skipping.")
-            yield Event(author=self.name, content=types.Content(role="model",parts=[types.Part(text="Static asset pipeline skipped: no boxscore data for player maps.")]))
+        if not current_recap:
+            logger.warning(f"[{self.name}] 'current_recap' missing. Skipping static asset pipeline.")
+            yield Event(author=self.name, content=types.Content(role="model", parts=[types.Part(text="Static asset pipeline skipped: no recap.")]))
             return
 
-        # Build Player Maps
-        player_id_to_name_map, player_name_to_id_map_lower = self._build_player_maps_from_boxscore(boxscore_details_json_str)
-        
-        # Store the original player_id_to_name_map in session state if other agents might need it directly,
-        # though this agent primarily uses the lowercase one for its lookups.
-        # For consistency, if StaticAssetRetriever was expecting player_lookup_dict_json:
-        ctx.session.state["player_lookup_dict_json"] = json.dumps(player_id_to_name_map)
-
-
-        # Step 1: Extract Entities from Recap
+        # Step 1: Extract Entities
         logger.info(f"[{self.name}] Running EntityExtractorForAssets...")
         async for event in self.entity_extractor.run_async(ctx): yield event
         
-        # Step 2: Generate Search Queries based on Entities
+        # Step 2: Generate Search Queries
         logger.info(f"[{self.name}] Running StaticAssetQueryGenerator...")
         async for event in self.static_asset_query_generator.run_async(ctx): yield event
         
         queries_json_str = ctx.session.state.get("static_asset_search_queries_json", "[]")
-        # ... (parse search_queries - same as before) ...
+        logger.info(f"[{self.name}] Raw output from StaticAssetQueryGenerator: '{queries_json_str[:500]}...'")
         cleaned_queries_json_str = _clean_json_string_from_llm(queries_json_str)
+        logger.info(f"[{self.name}] Cleaned queries JSON: '{cleaned_queries_json_str[:500]}...'")
+        
         search_queries = []
         try:
             parsed_queries = json.loads(cleaned_queries_json_str)
             if isinstance(parsed_queries, list):
-                search_queries = [str(q) for q in parsed_queries if isinstance(q, str)]
-        except Exception as e: logger.error(f"[{self.name}] Failed to parse search_queries: {e}")
-        logger.info(f"[{self.name}] Generated {len(search_queries)} search queries: {search_queries}")
+                search_queries = [str(q) for q in parsed_queries if isinstance(q, str)] # Ensure strings
+            else:
+                logger.error(f"[{self.name}] Parsed static asset search queries is not a list: {type(parsed_queries)}")
+        except json.JSONDecodeError as e:
+            logger.error(f"[{self.name}] Failed to parse static_asset_search_queries_json: {e}. String was: '{cleaned_queries_json_str}'")
+        
+        logger.info(f"[{self.name}] Generated {len(search_queries)} search queries to process: {search_queries}")
+
+        # Ensure player_lookup_dict_json is properly populated and parsed
+        player_lookup_dict_json_str = ctx.session.state.get("player_lookup_dict_json", "{}")
+        player_lookup_dict = {}
+        try:
+            player_lookup_dict = json.loads(_clean_json_string_from_llm(player_lookup_dict_json_str))
+            if not isinstance(player_lookup_dict, dict):
+                logger.warning(f"[{self.name}] player_lookup_dict_json parsed into non-dict: {type(player_lookup_dict)}. Defaulting to empty.")
+                player_lookup_dict = {}
+        except json.JSONDecodeError:
+            logger.error(f"[{self.name}] Failed to parse player_lookup_dict_json: '{player_lookup_dict_json_str}'. Defaulting to empty.")
+        
+        player_name_to_id_map_lower = {str(name).lower(): str(id_) for id_, name in player_lookup_dict.items() if name}
+        logger.info(f"[{self.name}] Player name to ID map (lowercase keys): {player_name_to_id_map_lower}")
+
 
         found_assets_list = []
         for original_query_string in search_queries:
-            # ... (logo processing logic - same as before) ...
-            # ... (headshot processing logic - uses player_name_to_id_map_lower and player_id_to_name_map) ...
-            # (Ensure this part is exactly as in your previously working version)
+            logger.info(f"[{self.name}] Processing query: '{original_query_string}'")
             team_name_for_logo = self._extract_team_name_from_query(original_query_string)
             player_name_for_headshot = self._extract_player_name_from_query(original_query_string)
 
             if team_name_for_logo:
                 logger.info(f"[{self.name}] Identified as LOGO query for team: '{team_name_for_logo}'")
-                ctx.session.state["team_name_for_logo_search"] = team_name_for_logo 
+                ctx.session.state["team_name_for_logo_search"] = team_name_for_logo
                 async for event in self.logo_searcher_llm.run_async(ctx): yield event
+                
                 logo_result_json_str = ctx.session.state.get("logo_search_result_json", "[]")
                 cleaned_logo_result_str = _clean_json_string_from_llm(logo_result_json_str)
+                logger.info(f"[{self.name}] Logo searcher LlmAgent output: '{cleaned_logo_result_str[:200]}...'")
                 try:
-                    logo_results = json.loads(cleaned_logo_result_str) 
+                    logo_results = json.loads(cleaned_logo_result_str) # Tool directly returns a list in JSON string
                     if logo_results and isinstance(logo_results, list) and logo_results[0].get("image_uri"):
                         asset_info = logo_results[0]
                         asset_info["search_term_origin"] = original_query_string
                         found_assets_list.append(asset_info)
-                except Exception as e: logger.error(f"[{self.name}] Error parsing logo result: {e}")
-
+                        logger.info(f"[{self.name}] Successfully retrieved logo: {asset_info.get('image_uri')}")
+                    else:
+                        logger.warning(f"[{self.name}] No valid logo found for '{team_name_for_logo}'. Result: {cleaned_logo_result_str}")
+                except json.JSONDecodeError as e:
+                    logger.error(f"[{self.name}] Failed to parse logo search result: {e}. String was: '{cleaned_logo_result_str}'")
 
             elif player_name_for_headshot:
-                normalized_lookup_name = player_name_for_headshot.strip().lower()
-                player_id = player_name_to_id_map_lower.get(normalized_lookup_name)
-                original_player_name_for_log = player_id_to_name_map.get(player_id) if player_id else player_name_for_headshot
+                logger.info(f"[{self.name}] Identified as HEADSHOT query for player: '{player_name_for_headshot}'")
+                player_id = player_name_to_id_map_lower.get(player_name_for_headshot.lower())
+                original_player_name = player_lookup_dict.get(player_id) if player_id else player_name_for_headshot # Get original casing
 
                 if player_id:
-                    logger.info(f"[{self.name}] HEADSHOT: Found Player ID '{player_id}' for '{player_name_for_headshot}' (looked up as '{normalized_lookup_name}'). Original map name: '{original_player_name_for_log}'")
-                    ctx.session.state["player_id_for_headshot_search"] = str(player_id) 
-                    ctx.session.state["player_name_for_headshot_log"] = original_player_name_for_log
+                    logger.info(f"[{self.name}] Found Player ID '{player_id}' for '{player_name_for_headshot}'. Original name: '{original_player_name}'")
+                    ctx.session.state["player_id_for_headshot_search"] = str(player_id) # Ensure string
+                    ctx.session.state["player_name_for_headshot_log"] = original_player_name
                     async for event in self.headshot_retriever_llm.run_async(ctx): yield event
+
                     headshot_result_json_str = ctx.session.state.get("headshot_uri_result_json", "{}")
                     cleaned_headshot_result_str = _clean_json_string_from_llm(headshot_result_json_str)
+                    logger.info(f"[{self.name}] Headshot retriever LlmAgent output: '{cleaned_headshot_result_str[:200]}...'")
                     try:
-                        headshot_result = json.loads(cleaned_headshot_result_str)
+                        headshot_result = json.loads(cleaned_headshot_result_str) # Tool directly returns an object in JSON string
                         if headshot_result and isinstance(headshot_result, dict) and headshot_result.get("image_uri"):
                             asset_info = headshot_result
                             asset_info["search_term_origin"] = original_query_string
                             found_assets_list.append(asset_info)
-                    except Exception as e: logger.error(f"[{self.name}] Error parsing headshot result: {e}")
+                            logger.info(f"[{self.name}] Successfully retrieved headshot: {asset_info.get('image_uri')}")
+                        else:
+                            logger.warning(f"[{self.name}] No headshot URI found for '{original_player_name}' (ID: {player_id}). Result: {cleaned_headshot_result_str}")
+                    except json.JSONDecodeError as e:
+                        logger.error(f"[{self.name}] Failed to parse headshot search result: {e}. String was: '{cleaned_headshot_result_str}'")
                 else:
-                    logger.warning(f"[{self.name}] HEADSHOT: Player ID NOT FOUND for '{player_name_for_headshot}' (looked up as '{normalized_lookup_name}')")
+                    logger.warning(f"[{self.name}] Player ID NOT FOUND for headshot query: '{player_name_for_headshot}' (searched as '{player_name_for_headshot.lower()}')")
+            else:
+                logger.warning(f"[{self.name}] Unrecognized query format, skipping: '{original_query_string}'")
         
         ctx.session.state["current_static_assets_list"] = found_assets_list
-        # ... (final logging and yield event)
         logger.info(f"[{self.name}] Static asset retrieval pipeline finished. Found {len(found_assets_list)} static assets.")
-        if found_assets_list: logger.info(f"[{self.name}] Details of static assets: {json.dumps(found_assets_list, indent=2)}")
+        if found_assets_list:
+            logger.info(f"[{self.name}] Details of static assets: {json.dumps(found_assets_list, indent=2)}")
         yield Event(author=self.name, content=types.Content(role="model", parts=[types.Part(text=f"Static asset pipeline complete. Found {len(found_assets_list)} assets.")]))
 
 ################################################################################
@@ -1030,87 +988,161 @@ class AssetValidationAndRetryAgent(BaseAgent):
         logger.info(f"[{self.name}] Asset validation and retry process finished.")
         yield Event(author=self.name, content=types.Content(role="model", parts=[types.Part(text="Asset validation and retry efforts complete.")]))
 
-
 ################################################################################
-# --- GameRecapAgent Definition (Focus on Static Asset Pipeline with Player Mapping) ---
+# --- GameRecapAgent Definition (Modular Audio, Full Pipeline) ---
 ################################################################################
 class GameRecapAgent(BaseAgent):
     model_config = {"arbitrary_types_allowed": True}
-    player_mapping_agent: LlmAgent # New
     initial_recap_generator: LlmAgent
-    static_asset_pipeline: StaticAssetPipelineAgent # Uses the refactored one
+    recap_critic: LlmAgent
+    critique_processor: LlmAgent
+    recap_reviser: LlmAgent
+    grammar_check: LlmAgent
+    tone_check: LlmAgent
+    refinement_loop: LoopAgent
+    post_processing_sequence: SequentialAgent
+    
+    visual_asset_workflow_orchestrator: VisualAssetWorkflowAgent
+    text_to_speech_agent: TextToSpeechAgent             # Updated
+    speech_to_timestamps_agent: SpeechToTimestampsAgent # Updated
+    asset_validator: AssetValidationAndRetryAgent 
 
     def __init__(
         self,
         name: str,
-        player_mapping_agent: LlmAgent, # New
         initial_recap_generator: LlmAgent,
-        static_asset_pipeline: StaticAssetPipelineAgent,
+        recap_critic: LlmAgent,
+        critique_processor: LlmAgent,
+        recap_reviser: LlmAgent,
+        grammar_check: LlmAgent,
+        tone_check: LlmAgent,
+        visual_asset_workflow_orchestrator: VisualAssetWorkflowAgent,
+        text_to_speech_agent: TextToSpeechAgent,             # Updated
+        speech_to_timestamps_agent: SpeechToTimestampsAgent, # Updated
+        # AssetValidator is created internally
     ):
-      
+        refinement_loop = LoopAgent(
+            name="RecapRefinementLoop",
+            sub_agents=[recap_critic, critique_processor, recap_reviser],
+            max_iterations=1
+        )
+        post_processing_sequence = SequentialAgent(
+            name="RecapPostProcessing",
+            sub_agents=[grammar_check, tone_check]
+        )
+        
+        asset_validator_instance = AssetValidationAndRetryAgent(
+            name="AssetValidationAndRetry",
+            static_asset_pipeline_agent=visual_asset_workflow_orchestrator.static_asset_pipeline_agent,
+            iterative_image_generation_agent=visual_asset_workflow_orchestrator.iterative_image_generation_agent,
+            video_pipeline_agent=visual_asset_workflow_orchestrator.video_pipeline_agent,
+            text_to_speech_agent=text_to_speech_agent,                         # Pass the TTS agent instance
+            speech_to_timestamps_agent=speech_to_timestamps_agent,             # Pass the STT agent instance
+            max_retries_per_pipeline=1 
+        )
+
+        sub_agents_list = [
+            initial_recap_generator,
+            refinement_loop,
+            post_processing_sequence,
+            visual_asset_workflow_orchestrator,
+            text_to_speech_agent,             # Add TTS agent
+            speech_to_timestamps_agent,       # Add STT agent
+            asset_validator_instance,
+        ]
         super().__init__(
             name=name,
-            player_mapping_agent=player_mapping_agent,
             initial_recap_generator=initial_recap_generator,
-            static_asset_pipeline=static_asset_pipeline,
-            
+            recap_critic=recap_critic,
+            critique_processor=critique_processor,
+            recap_reviser=recap_reviser,
+            grammar_check=grammar_check,
+            tone_check=tone_check,
+            refinement_loop=refinement_loop,
+            post_processing_sequence=post_processing_sequence,
+            visual_asset_workflow_orchestrator=visual_asset_workflow_orchestrator,
+            text_to_speech_agent=text_to_speech_agent,                 # Pydantic field
+            speech_to_timestamps_agent=speech_to_timestamps_agent,     # Pydantic field
+            asset_validator=asset_validator_instance,
+            sub_agents=sub_agents_list
         )
 
     @override
     async def _run_async_impl(self, ctx: InvocationContext) -> AsyncGenerator[Event, None]:
-        logger.info(f"[{self.name}] Starting FOCUSED (PLAYER MAP + STATIC ASSETS) workflow.")
+        logger.info(f"[{self.name}] Starting FULL game recap and asset workflow (modular audio).")
 
+        # --- 0. Pre-requisites (Same as before) ---
+        # ... (user_query and player_lookup_dict_json setup) ...
         user_query = ctx.session.state.get("user_query") 
-        if not user_query: # ... (set default user_query) ...
-            user_query = "generic recap request (player map + static asset focus)" 
+        if not user_query:
+            user_query = "generic recap request" 
             ctx.session.state["user_query"] = user_query
             logger.info(f"[{self.name}] User query set to: '{user_query}'")
-        
-        # Crucial: game_pk must be set for PlayerMappingAgent to work
-        # This would typically be done by a preceding agent or from user input.
-        # For testing, you might need to hardcode it or ensure your test query implies it.
-        if "game_pk" not in ctx.session.state:
-            logger.error(f"[{self.name}] 'game_pk' not in session state. PlayerMappingAgent will likely fail.")
-            # For a focused test, you might set a default game_pk if not present
-            # ctx.session.state["game_pk"] = "YOUR_TEST_GAME_PK" 
-            # return # Or allow to proceed and see it fail gracefully
+        if "player_lookup_dict_json" not in ctx.session.state: 
+            ctx.session.state["player_lookup_dict_json"] = "{}"
 
-        # Step 0: Get Player Mappings
-        logger.info(f"[{self.name}] Running PlayerMappingAgent...")
-        async for event in self.player_mapping_agent.run_async(ctx): yield event
-        boxscore_json = ctx.session.state.get("boxscore_details_json_str")
-        if not boxscore_json or boxscore_json == "{}": # Check if it's empty
-            logger.error(f"[{self.name}] PlayerMappingAgent did not populate 'boxscore_details_json_str'. Aborting.")
-            yield Event(author=self.name, content=types.Content(role="model", parts=[types.Part(text="Failed to get boxscore details for player mapping.")]))
-            return
-        logger.info(f"[{self.name}] PlayerMappingAgent finished. boxscore_details_json_str (first 100): {boxscore_json[:100]}")
-
-
-        # Step 1: Dialogue Generation 
+        # --- 1. Dialogue Generation & Refinement (Same as before) ---
         logger.info(f"[{self.name}] Running InitialRecapGenerator (Dialogue)...")
         async for event in self.initial_recap_generator.run_async(ctx): yield event
+        dialogue_after_initial_gen = ctx.session.state.get("current_recap", "")
+        # ... (check for early exit, refinement_loop, post_processing_sequence) ...
+        agent_should_exit = ctx.session.state.get("agent_should_exit_flag", False)
+        if agent_should_exit or not dialogue_after_initial_gen or "game is not final" in dialogue_after_initial_gen.lower():
+            message = dialogue_after_initial_gen or "Recap generation stopped early."
+            logger.warning(f"[{self.name}] Initial recap phase indicated exit. Message: {message}")
+            yield Event(author=self.name, content=types.Content(role="model", parts=[types.Part(text=message)]))
+            return
+        logger.info(f"[{self.name}] Running Dialogue RefinementLoop...")
+        async for event in self.refinement_loop.run_async(ctx): yield event
+        logger.info(f"[{self.name}] Running Dialogue PostProcessing Sequence...")
+        async for event in self.post_processing_sequence.run_async(ctx): yield event
         final_dialogue_recap = ctx.session.state.get("current_recap", "")
-        if not final_dialogue_recap: # ... (handle missing recap) ...
-            logger.error(f"[{self.name}] Dialogue recap is empty. Aborting.")
+        if not final_dialogue_recap:
+            logger.error(f"[{self.name}] Dialogue recap is empty after refinement. Aborting full pipeline.")
             yield Event(author=self.name, content=types.Content(role="model", parts=[types.Part(text="Failed to produce dialogue recap.")]))
             return
         logger.info(f"[{self.name}] Dialogue workflow finished.")
 
-        # Step 2: Static Asset Workflow 
-        logger.info(f"[{self.name}] Running StaticAssetPipelineAgent...")
-        async for event in self.static_asset_pipeline.run_async(ctx): yield event
-        static_assets_found = ctx.session.state.get("current_static_assets_list", [])
-        logger.info(f"[{self.name}] StaticAssetPipelineAgent finished. Found {len(static_assets_found)} static assets.")
+        # --- 2. Visual Asset Workflow ---
+        logger.info(f"[{self.name}] Running VisualAssetWorkflow Orchestrator...")
+        async for event in self.visual_asset_workflow_orchestrator.run_async(ctx):
+            yield event
+        logger.info(f"[{self.name}] VisualAssetWorkflow Orchestrator finished.")
+
+        # --- 3. Audio Processing Workflow (Modular) ---
+        if final_dialogue_recap:
+            logger.info(f"[{self.name}] Running TextToSpeechAgent...")
+            async for event in self.text_to_speech_agent.run_async(ctx):
+                yield event
+            generated_audio_uri = ctx.session.state.get("generated_dialogue_audio_uri")
+            logger.info(f"[{self.name}] TextToSpeechAgent finished. Audio URI: {generated_audio_uri}")
+
+            if generated_audio_uri:
+                logger.info(f"[{self.name}] Running SpeechToTimestampsAgent...")
+                async for event in self.speech_to_timestamps_agent.run_async(ctx):
+                    yield event
+                logger.info(f"[{self.name}] SpeechToTimestampsAgent finished. Timestamps: {len(ctx.session.state.get('word_timestamps_list',[]))}")
+            else:
+                logger.warning(f"[{self.name}] Skipping SpeechToTimestampsAgent as no audio URI was generated by TTS.")
+        else:
+            logger.warning(f"[{self.name}] Skipping all Audio Processing as final dialogue recap is empty.")
+
+        # --- 4. Asset Validation and Retry Step ---
+        if self.asset_validator and self.asset_validator.max_retries_per_pipeline > 0:
+           logger.info(f"[{self.name}] Running AssetValidationAndRetryAgent...")
+           async for event in self.asset_validator.run_async(ctx):
+              yield event
+           logger.info(f"[{self.name}] AssetValidationAndRetryAgent finished.")
         
-        yield Event(author=self.name, content=types.Content(role="model", parts=[types.Part(text=f"Focused Test Complete. Static Assets Found: {len(static_assets_found)}")]))
-        logger.info(f"[{self.name}] === GameRecapAgent (PLAYER MAP + STATIC ASSETS FOCUS) processing complete. ===")
-
-
-
-
-
-
-
+        # --- Final Logging & Output (Same as before) ---
+        all_image_assets_final = ctx.session.state.get("all_image_assets_list", [])
+        all_video_assets_final = ctx.session.state.get("all_video_assets_list", [])
+        audio_uri_final = ctx.session.state.get("generated_dialogue_audio_uri")
+        timestamps_final_count = len(ctx.session.state.get("word_timestamps_list", []))
+        logger.info(f"[{self.name}] Post-Validation - Total Images: {len(all_image_assets_final)}, Videos: {len(all_video_assets_final)}, Audio: {'Yes' if audio_uri_final else 'No'}, Timestamps: {timestamps_final_count}")
+        
+        yield Event(author=self.name, content=types.Content(role="model", parts=[types.Part(text=final_dialogue_recap)]))
+        logger.info(f"[{self.name}] === GameRecapAgent FULL processing complete (modular audio). ===")
 
 # --- Tool Collection (Assumed unchanged) ---
 async def _collect_tools_stack(
@@ -1234,53 +1266,55 @@ async def create_agent_with_preloaded_tools(
         name="InitialRecapGenerator",
         model=GEMINI_PRO_MODEL_ID,
         instruction="""
-You are an expert sports journalist tasked with generating an initial MLB game recap in a **two-host dialogue script format**.
+You are an expert sports journalist tasked with generating an initial MLB game recap in a **two-host dialogue script format**. Your goal is to create a compelling narrative of the game, not just a list of events,  presented as a conversation.
 
 Session State Expectations:
-- `game_pk`: The unique ID for the game.
-- `user_query`: The user's original request.
-- `boxscore_details_json_str`: A JSON string containing comprehensive game boxscore data, including player rosters and team stats. You should parse this for your information.
+- `game_pk` (e.g., 717527): The unique ID for the game.
+- `user_query`: The user's original request (e.g., "recap of Pirates last game").
+- `parsed_game_pk_from_query` (Optional): A game_pk parsed directly from the user's query. Prioritize this.
+- `pre_game_context_notes` (Optional): Web search findings about rivalry, storylines, etc.
+- `past_critiques_feedback` (Optional): General feedback from past similar tasks to guide style and tone.
 
 Your Multi-Step Process:
 
-1.  **Game Identification (Confirmation):**
-    *   Confirm `game_pk` is available from session state. If not, this is an error, use `agent_exit`.
-    *   Announce the identified game for context in your thought process.
+1.  **Game Identification (Critical):**
+    *   If `game_pk` is not in session state: Analyze `user_query`.
+    *   If the query implies a "latest" game (e.g., "Brewers last game"), use `mlb.get_team_schedule` (e.g., `days_range=-7`) to find the most recent *final* game. Extract its `game_pk`. If ambiguity, ask for clarification.
+    *   Announce the identified game: "Okay, I've identified the game: Team A vs Team B on YYYY-MM-DD, Game PK: [game_pk]." Update `session.state.game_pk`.
+    *   If no specific game can be confidently identified, state this and request clarification. Do NOT invent a `game_pk`. Use `agent_exit`.
 
-2.  **Parse Provided Data & Gather Supplemental Data:**
-    *   Parse the JSON string from `session.state.boxscore_details_json_str` to understand team names, player names involved, final scores, and key team/player stats.
-    *   Call `mlb.get_live_game_score` for `game_pk` (if needed for real-time details not in boxscore).
-    *   Call `mlb.get_game_play_by_play_summary` for `game_pk` (get enough plays for key moments).
-    *   From all gathered data, determine game status. If not "Final", output that a recap isn't ready and use `agent_exit`.
+2.  **Gather Core Game Data (if `game_pk` is now known):**
+    *   Call `mlb.get_live_game_score` for `game_pk`.
+    *   Call `mlb.get_game_play_by_play_summary` for `game_pk` (get enough plays, e.g., 15-20, to understand key moments).
+    *   Call `mlb_stats.get_game_boxscore_and_details` for `game_pk`.
+    *   Parse the data: game status, final score, winning/losing pitchers, key offensive performers (multi-hit, RBIs, HRs), inning-by-inning scores.
+    *   **If Game Status is "Scheduled" or not "Final"**: Your output MUST state that a full recap is not yet available as the game is not final. Then use `agent_exit`.
 
 3.  **Synthesize Initial Dialogue Script (Only if Game is "Final"):**
-    *   Use the parsed boxscore data, PBP, and live score data to construct the dialogue.
-    *   Focus on telling the story of the game: key scoring plays, turning points, standout performances (both good and bad), pitching narratives.
-    *   The dialogue MUST be between two hosts, alternating strictly, with NO speaker labels.
-    *   Use vivid, journalistic language.
+    *   **Dialogue Format:**
+        *   The entire output MUST be a conversation between two hosts (e.g., Host A, Host B).
+        *   **Strict Alternation:** Each line of the script MUST represent one host speaking, alternating strictly.
+        *   **NO Speaker Labels:** CRITICAL: Do NOT include speaker labels like "Host 1:", "Host 2:", or any character names. Just write the raw dialogue line for each speaker's turn.
+    *   **Storytelling First:** Your primary goal is to tell the story of the game through this dialogue.
+        *   Identify a potential "story of the game" (e.g., a pitcher's duel, an offensive breakout, a key player's heroics, a specific turning point).
+        *   The dialogue should start with an engaging lead, perhaps one host setting the scene and the other reacting or adding initial thoughts, summarizing the game's outcome and main storyline.
+    *   **Pitching Narrative:** The hosts should discuss the performance of the starting pitchers, especially the winner and loser.
+    *   **Offensive Highlights & Progression:**
+        *   The dialogue should cover how the scoring unfolded, focusing on the most impactful plays.
+        *   Hosts should name the players involved in these key offensive moments and discuss their contributions.
+    *   **Integrate Context:**
+        *   If `pre_game_context_notes` are available, one host might bring it up, and the other can elaborate or connect it to game events.
+    *   **Guidance from Past Critiques:** Use `past_critiques_feedback` (if available) for general guidance on narrative structure, tone, and conversational style.
+    *   **Language:** Use vivid, active language. The dialogue should sound natural and engaging. Avoid one host just listing stats for the other to react to; make it a genuine discussion.
+    *   **Acknowledge Limitations:** If specific details are unavailable, one host might pose it as a question the other can't fully answer, or they might acknowledge the gap.
 
-Output ONLY the generated recap text. You are NOT responsible for creating or storing player ID maps; that data is in `boxscore_details_json_str` for your reference.
+Output ONLY the generated recap text. Do not add conversational fluff like "Here is the recap..." or "I have gathered the data...".
         """,
         tools=[ # Ensure all necessary tools are listed
             tool for toolset_name in ["bq_search", "mlb", "web_search"] 
             for tool in loaded_mcp_tools.get(toolset_name, [])
         ],
         output_key="current_recap",
-    )
-
-    
-    player_mapping_agent = LlmAgent(
-        name="PlayerMappingAgent",
-        model=GEMINI_FLASH_MODEL_ID, # Simple tool call
-        instruction="""Your ONLY task is to call the `mlb_.get_game_boxscore_and_details` tool.
-You will receive `game_pk` in session state.
-Use the `game_pk` from `{session.state.game_pk}` as the parameter for the tool call.
-Your entire output MUST be ONLY the direct, verbatim JSON string that is returned by the tool.
-Do NOT add any other text, explanation, or formatting.
-This JSON string will contain all boxscore details including player rosters.
-""",
-        tools=loaded_mcp_tools_global.get("mlb", []), # Ensure this tool is available
-        output_key="boxscore_details_json_str" # The raw JSON string from the tool
     )
 
     recap_critic_agent = LlmAgent(
@@ -1521,37 +1555,35 @@ then output an empty JSON list string: "[]".
     name="StaticAssetRetriever",
     model=GEMINI_PRO_MODEL_ID, # Needs to be good at instruction following and JSON manipulation
     instruction="""
-You are a methodical asset retrieval coordinator.
-Your goal is to process a list of search queries and return a JSON list of successfully retrieved assets.
-
+You are an asset retrieval coordinator.
 Expected in session state:
-- `static_asset_search_queries_json`: A JSON string which is a list of search queries (e.g., `["TeamA logo", "PlayerX headshot"]`).
-- `player_lookup_dict_json`: A JSON string which is a dictionary mapping player IDs to full names (e.g., `{"123": "PlayerX"}`).
+- 'static_asset_search_queries_json': A JSON string list of queries (e.g., '["Los Angeles Angels logo", "Willy Adames headshot"]').
+- 'player_lookup_dict_json': A JSON string of a dictionary mapping player IDs to full names (e.g., '{"12345": "Willy Adames", ...}').
 
-Your process:
-1.  Parse the `static_asset_search_queries_json` string into a Python list of query strings.
-2.  Parse the `player_lookup_dict_json` string into a Python dictionary. Create an inverse map of (lowercase player full name -> player_id).
-3.  Initialize an empty Python list called `retrieved_assets`.
-4.  For each `query_string` in your parsed list of queries:
-    a.  **Determine Asset Type:**
-        *   If `query_string` contains "logo":
-            i.  Extract the full team name (e.g., "New York Yankees" from "New York Yankees logo").
-            ii. **Call the tool `image_embedding_mcp.search_similar_images_by_text`**. Use parameters: `query_text` = (the extracted team name), `top_k` = 1, `filter_image_type` = "logo".
-            iii. The tool will return a JSON string (a list of results). Parse it. If results are present and valid, take the first result dictionary.
-            iv. If a valid asset dictionary is retrieved and it contains an `image_uri`, create a new dictionary: `{"search_term_origin": query_string, **logo_asset_dictionary}` and append this new dictionary to your `retrieved_assets` list.
-        *   Else if `query_string` contains "headshot":
-            i.  Extract the player's full name (e.g., "Aaron Judge" from "Aaron Judge headshot").
-            ii. Find the `player_id` using your inverse player name map (use lowercase for lookup).
-            iii. If a `player_id` is found:
-                1. Get the original casing player name using the `player_id` from your parsed player lookup dictionary.
-                2. **Call the tool `static_retriever_mcp.get_headshot_uri_if_exists`**. Use parameters: `player_id_str` = (the found player_id as a string), `player_name_for_log` = (the original casing player name).
-                3. The tool will return a JSON string. Parse it.
-                4. If the parsed dictionary contains an `image_uri` and it's not null, create a new dictionary: `{"search_term_origin": query_string, **headshot_asset_dictionary}` and append this new dictionary to your `retrieved_assets` list.
-    b.  If a tool call fails or returns no valid asset with an `image_uri`, simply log (internally for your thought process) that it failed for that query and continue to the next query. Do not stop the whole process.
-5.  After attempting to process all query strings, your FINAL output for this entire step MUST be the direct, verbatim JSON string representation of your accumulated `retrieved_assets` list.
-    Example: `[{"search_term_origin": "Query A", "image_uri": "gs://...", ...}, {"search_term_origin": "Query B", "image_uri": "gs://...", ...}]`
-    If `retrieved_assets` is empty after processing all queries (e.g., no assets were found or all tool calls failed), output the string `"[]"`.
-    DO NOT add any other text, markdown, or explanation around this final JSON string.
+Your task is to process each query from 'static_asset_search_queries_json':
+1.  Parse 'player_lookup_dict_json' into a Python dictionary (player_id: player_name). Create an inverse mapping (player_name_lower_case: player_id) for efficient lookup.
+2.  Initialize an empty list called `found_assets_list`.
+3.  For each `original_query_string` in the parsed list from 'static_asset_search_queries_json':
+    a.  If the `original_query_string` contains "logo" (e.g., "Los Angeles Angels logo"):
+        i.  Carefully extract the full team name (e.g., "Los Angeles Angels"). This might involve removing " logo" and trimming whitespace.
+        ii. Call the `image_embedding_mcp.search_similar_images_by_text` tool with:
+            - `query_text` = the extracted full team name.
+            - `top_k` = 1.
+            - `filter_image_type` = "logo".
+        iii.The tool returns a JSON string representing a list of results. Parse this JSON string. If results are present, take the first result dictionary.
+        iv. If a valid logo asset dictionary is retrieved, add `{"search_term_origin": original_query_string, **logo_asset_dict}` to `found_assets_list`. (Ensure the final dict has image_uri, type, entity_name, etc.)
+    b.  If the `original_query_string` contains "headshot" (e.g., "Willy Adames headshot"):
+        i.  Extract the player's full name (e.g., "Willy Adames").
+        ii. Convert the extracted name to lowercase. Look up this lowercase name in your inverted player lookup map to get the `player_id`.
+        iii.If a `player_id` is found:
+            1. Retrieve the original casing player name using the `player_id` from the initial `player_lookup_dict`.
+            2. Call the `static_retriever_mcp.get_headshot_uri_if_exists` tool with:
+                - `player_id_str` = the found `player_id` (as a string).
+                - `player_name_for_log` = the original casing player name.
+        iv. The tool returns a JSON string. Parse it. If `image_uri` is present in the parsed dictionary, add `{"search_term_origin": original_query_string, **headshot_asset_dict}` to `found_assets_list`.
+    c.  If a query is unrecognized, skip it.
+4.  After processing all queries, convert `found_assets_list` into a JSON string. This is your final output.
+    If 'static_asset_search_queries_json' was initially empty or no assets were successfully found and added to `found_assets_list`, output an empty JSON list string: "[]".
     """,
     tools=[
         *loaded_mcp_tools_global.get("static_retriever_mcp", []),
@@ -1561,30 +1593,36 @@ Your process:
 )
 
 
-    # LlmAgent specifically for searching logos
-    logo_searcher_llm_agent = LlmAgent(
+    # --- NEW Simpler LlmAgents for individual tool calls within StaticAssetPipelineAgent ---
+    logo_searcher_llm_agent = LlmAgent( # Renamed from logo_searcher_llm for consistency
         name="LogoSearcherLlm",
-        model=GEMINI_FLASH_MODEL_ID, # Can be a simpler model for a direct tool call
+        model=GEMINI_FLASH_MODEL_ID, 
         instruction="""Your ONLY task is to call the `image_embedding_mcp.search_similar_images_by_text` tool.
 You will be given `team_name_for_logo_search` in session state.
-Use parameters: `query_text` = {session.state.team_name_for_logo_search}, `top_k` = 1, `filter_image_type` = "logo".
-Output ONLY the direct JSON string result from the tool.
+Use these exact parameters for the tool call:
+- `query_text`: {session.state.team_name_for_logo_search}
+- `top_k`: 1
+- `filter_image_type`: "logo"
+Your entire output MUST be ONLY the direct, verbatim JSON string that is returned by the tool.
+Do NOT add any other text, explanation, or formatting.
 """,
         tools=loaded_mcp_tools_global.get("image_embedding_mcp", []),
-        output_key="logo_search_result_json" # JSON string (list of results)
+        output_key="logo_search_result_json" 
     )
 
-    # LlmAgent specifically for retrieving headshots
-    headshot_retriever_llm_agent = LlmAgent(
+    headshot_retriever_llm_agent = LlmAgent( # Renamed from headshot_retriever_llm for consistency
         name="HeadshotRetrieverLlm",
-        model=GEMINI_FLASH_MODEL_ID, # Can be a simpler model
+        model=GEMINI_FLASH_MODEL_ID, 
         instruction="""Your ONLY task is to call the `static_retriever_mcp.get_headshot_uri_if_exists` tool.
 You will be given `player_id_for_headshot_search` and `player_name_for_headshot_log` in session state.
-Use parameters: `player_id_str` = {session.state.player_id_for_headshot_search}, `player_name_for_log` = {session.state.player_name_for_headshot_log}.
-Output ONLY the direct JSON string result from the tool.
+Use these exact parameters for the tool call:
+- `player_id_str`: {session.state.player_id_for_headshot_search}
+- `player_name_for_log`: {session.state.player_name_for_headshot_log}
+Your entire output MUST be ONLY the direct, verbatim JSON string that is returned by the tool.
+Do NOT add any other text, explanation, or formatting.
 """,
         tools=loaded_mcp_tools_global.get("static_retriever_mcp", []),
-        output_key="headshot_uri_result_json" # JSON string (dict with image_uri or null)
+        output_key="headshot_uri_result_json"
     )
 
     generated_visual_prompts_agent = LlmAgent(
@@ -1818,8 +1856,8 @@ You are an audio transcription robot. Your ONLY task is to manage a tool call an
         name="StaticAssetPipeline",
         entity_extractor=entity_extractor_agent,
         static_asset_query_generator=static_asset_query_generator_agent,
-        logo_searcher_llm=logo_searcher_llm_agent,
-        headshot_retriever_llm=headshot_retriever_llm_agent
+        logo_searcher_llm=logo_searcher_llm_agent, # Pass the LlmAgent instance
+        headshot_retriever_llm=headshot_retriever_llm_agent # Pass the LlmAgent instance
     )
     iterative_image_generation_agent_instance = IterativeImageGenerationAgent(
         name="IterativeImageGeneration",
@@ -1856,19 +1894,17 @@ You are an audio transcription robot. Your ONLY task is to manage a tool call an
     # --- Instantiate GameRecapAgent with focus on audio ---
     game_recap_assistant = GameRecapAgent(
         name="game_recap_assistant",
-        player_mapping_agent=player_mapping_agent, 
         initial_recap_generator=initial_recap_generator_agent,
-        static_asset_pipeline=static_asset_pipeline_agent_instance,
-        #recap_critic=recap_critic_agent,
-        #critique_processor=critique_processor_agent,
-        #recap_reviser=recap_reviser_agent,
-        #grammar_check=grammar_check_agent,
-        #tone_check=tone_check_agent,
+        recap_critic=recap_critic_agent,
+        critique_processor=critique_processor_agent,
+        recap_reviser=recap_reviser_agent,
+        grammar_check=grammar_check_agent,
+        tone_check=tone_check_agent,
         # Pass the LlmAgents for TTS and Timestamps
-        #text_to_speech_agent=text_to_speech_agent_instance,           # Pass modular TTS agent
-        #speech_to_timestamps_agent=speech_to_timestamps_agent_instance, # Pass modular STT agent
+        text_to_speech_agent=text_to_speech_agent_instance,             # Pass modular TTS agent
+        speech_to_timestamps_agent=speech_to_timestamps_agent_instance, # Pass modular STT agent
         # Temporarily not passing:
-        #visual_asset_workflow_orchestrator=visual_asset_workflow_orchestrator_instance,
+        visual_asset_workflow_orchestrator=visual_asset_workflow_orchestrator_instance,
         # audio_processing_pipeline_agent=audio_processing_pipeline_agent_instance, # Old combined one
     )
 
