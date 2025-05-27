@@ -270,161 +270,7 @@ class QuerySetupAgent(BaseAgent):
 
 
 
-# REVISED DirectToolCallerBaseAgent for better FunctionResponse parsing
 
-# In main.py
-
-class DirectToolCallerBaseAgent(BaseAgent):
-    # Pydantic model_config:
-    # "extra = 'ignore'" (default) means undeclared fields in __init__ are ignored.
-    # "extra = 'allow'" means undeclared fields are allowed and stored on the model.
-    # BaseAgent might have its own model_config. Let's assume it allows additional attributes
-    # or we can set "extra = 'allow'" if needed, though usually not required for attributes
-    # set *after* super().__init__ that are not meant to be Pydantic fields.
-    model_config = {"arbitrary_types_allowed": True, "extra": "allow"} # Let's be explicit
-
-    # These are Pydantic fields, correctly declared:
-    tool_name_to_call: str
-    input_state_keys: Dict[str, str]
-    output_state_key: str
-    default_output_on_error: str
-    fixed_tool_args: Dict[str, Any] = {}
-
-    # _internal_llm will NOT be a Pydantic field.
-    # It will be a regular instance attribute.
-    # Remove: _internal_llm: Optional[LlmAgent] = Field(None, exclude=True)
-
-    def __init__(self,
-                 name: str,
-                 tool_name_to_call: str,
-                 input_state_keys: Dict[str, str],
-                 output_state_key: str,
-                 default_output_on_error: str = "{}",
-                 fixed_tool_args: Optional[Dict[str, Any]] = None,
-                 **kwargs):
-        super_kwargs = {
-            "name": name,
-            "tool_name_to_call": tool_name_to_call,
-            "input_state_keys": input_state_keys,
-            "output_state_key": output_state_key,
-            "default_output_on_error": default_output_on_error,
-            "fixed_tool_args": fixed_tool_args or {},
-            **kwargs
-        }
-        super().__init__(**super_kwargs)
-
-        # Initialize _internal_llm as a standard Python instance attribute
-        # AFTER super().__init__() has completed.
-        # Pydantic will not treat this as one of its fields.
-        self._internal_llm: Optional[LlmAgent] = None
-
-    def _get_or_initialize_internal_llm(self, ctx: InvocationContext) -> Optional[LlmAgent]:
-        if self._internal_llm is None: # Access the instance attribute
-            tool_instance_to_use = None
-            try:
-                tool_instance_to_use = ctx.get_tool(self.tool_name_to_call)
-            except Exception as e:
-                logger.debug(f"[{self.name}] ctx.get_tool for '{self.tool_name_to_call}' failed: {e}. Trying global.")
-            
-            if not tool_instance_to_use:
-                toolset_name, func_name = self.tool_name_to_call.split('.', 1) if '.' in self.tool_name_to_call else (None, None)
-                if toolset_name and func_name and toolset_name in loaded_mcp_tools_global:
-                    for t in loaded_mcp_tools_global[toolset_name]:
-                        tool_name_attr = getattr(t, 'name', None)
-                        decl_name_attr = getattr(t, 'function_declaration', None)
-                        if tool_name_attr == func_name or \
-                           (decl_name_attr and decl_name_attr.name == self.tool_name_to_call):
-                            tool_instance_to_use = t
-                            break
-                if not tool_instance_to_use:
-                    logger.error(f"[{self.name}] Could not find tool instance for '{self.tool_name_to_call}'.")
-                    return None
-            
-            temp_args_state_key = f"temp_tool_args_for_{self.name}_{self.tool_name_to_call.replace('.', '_')}"
-            instruction = f"""Your ONLY task is to make a SINGLE call to the tool named '{self.tool_name_to_call}'.
-All arguments for this tool call are in a dictionary in session state under the key '{temp_args_state_key}'.
-You MUST use these arguments precisely. The tool call will return a JSON string.
-Your entire and final output MUST be ONLY this direct, verbatim JSON string from the tool.
-DO NOT add any other text. If args are missing or invalid, output: "{self.default_output_on_error}"."""
-
-            # Initialize the instance attribute _internal_llm
-            self._internal_llm = LlmAgent(
-                name=f"{self.name}_InternalToolCaller", model=GEMINI_FLASH_MODEL_ID,
-                instruction=instruction, tools=[tool_instance_to_use],
-                output_key=f"temp_result_for_{self.name}_{self.tool_name_to_call.replace('.', '_')}"
-            )
-            logger.info(f"[{self.name}] Initialized internal LlmAgent for '{self.tool_name_to_call}'.")
-        return self._internal_llm # Return the instance attribute
-
-    @override
-    async def _run_async_impl(self, ctx: InvocationContext) -> AsyncGenerator[Event, None]:
-        # ... (The rest of this method remains the same as your last working version,
-        #      it will use self._get_or_initialize_internal_llm() which accesses self._internal_llm) ...
-        logger.info(f"[{self.name}] Orchestrating tool call for '{self.tool_name_to_call}'.")
-        tool_args = {}
-        tool_args.update(self.fixed_tool_args)
-        for tool_arg_name, state_key in self.input_state_keys.items():
-            value = ctx.session.state.get(state_key)
-            if value is not None: tool_args[tool_arg_name] = value
-            elif tool_arg_name not in tool_args:
-                 logger.warning(f"[{self.name}] Input state key '{state_key}' for '{tool_arg_name}' is None and not in fixed_args.")
-
-        if "prompts" in tool_args and isinstance(tool_args["prompts"], str) and \
-           (self.tool_name_to_call == "visual_assets.generate_images_from_prompts" or \
-            self.tool_name_to_call == "video_clip_generator_mcp.generate_video_clips_from_prompts"):
-            try:
-                tool_args["prompts"] = json.loads(_clean_json_string_from_llm(tool_args["prompts"], default_if_empty="[]"))
-                logger.info(f"[{self.name}] Converted 'prompts' from JSON string to list for tool call.")
-            except json.JSONDecodeError:
-                logger.error(f"[{self.name}] Failed to parse 'prompts' JSON: {tool_args['prompts']}.")
-                ctx.session.state[self.output_state_key] = self.default_output_on_error
-                yield Event(author=self.name, content=types.Content(role="model", parts=[types.Part(text=f"{self.name}: Failed to parse input prompts.")]))
-                return
-
-        internal_llm = self._get_or_initialize_internal_llm(ctx) # Uses the instance attribute
-        if not internal_llm:
-            logger.error(f"[{self.name}] Failed to initialize internal LlmAgent. Cannot call tool.")
-            ctx.session.state[self.output_state_key] = self.default_output_on_error
-            yield Event(author=self.name, content=types.Content(role="model", parts=[types.Part(text=f"{self.name}: Internal error during setup.")]))
-            return
-
-        temp_args_state_key = f"temp_tool_args_for_{self.name}_{self.tool_name_to_call.replace('.', '_')}"
-        temp_result_state_key = internal_llm.output_key
-
-        ctx.session.state[temp_args_state_key] = tool_args
-        logger.info(f"[{self.name}] Running internal LlmAgent. Args in '{temp_args_state_key}', result to '{temp_result_state_key}'.")
-
-        async for event in internal_llm.run_async(ctx): yield event
-
-        raw_tool_payload_str = ctx.session.state.get(temp_result_state_key, self.default_output_on_error)
-        tool_payload_str = raw_tool_payload_str
-
-        tool_call_successful = True
-        if isinstance(tool_payload_str, str):
-            try:
-                parsed_check = json.loads(tool_payload_str)
-                if isinstance(parsed_check, dict) and "error" in parsed_check:
-                    tool_call_successful = False
-                    logger.warning(f"[{self.name}] Tool call returned an error JSON: {tool_payload_str}")
-            except json.JSONDecodeError:
-                if tool_payload_str != self.default_output_on_error or \
-                   (self.default_output_on_error == "{}" and tool_payload_str != "{}") or \
-                   (self.default_output_on_error == "[]" and tool_payload_str != "[]"):
-                    logger.error(f"[{self.name}] Internal LlmAgent for '{self.tool_name_to_call}' output non-JSON: {tool_payload_str[:200]}...")
-                    tool_call_successful = False
-        else:
-            tool_call_successful = False
-            logger.error(f"[{self.name}] Expected string from internal LlmAgent ('{temp_result_state_key}'), got {type(tool_payload_str)}.")
-            tool_payload_str = self.default_output_on_error
-        
-        ctx.session.state[self.output_state_key] = tool_payload_str
-        if temp_args_state_key in ctx.session.state: del ctx.session.state[temp_args_state_key]
-        if temp_result_state_key in ctx.session.state: del ctx.session.state[temp_result_state_key]
-
-        final_thought = f"{self.name}: Tool '{self.tool_name_to_call}' processed. Output to '{self.output_state_key}'. Success: {tool_call_successful}. Payload: {str(tool_payload_str)[:100]}..."
-        logger.info(final_thought)
-        yield Event(author=self.name, content=types.Content(role="model", parts=[types.Part(text=final_thought)]))
-        
 ################################################################################
 # ---  PlayerIdPopulatorAgent ---
 ################################################################################
@@ -554,14 +400,14 @@ class StaticAssetPipelineAgent(BaseAgent):
     model_config = {"arbitrary_types_allowed": True}
     entity_extractor: LlmAgent
     static_asset_query_generator: LlmAgent
-    logo_searcher_llm: DirectToolCallerBaseAgent
-    headshot_retriever_llm: DirectToolCallerBaseAgent
+    logo_searcher_llm: LlmAgent
+    headshot_retriever_llm: LlmAgent
 
     def __init__(self, name: str,
                  entity_extractor: LlmAgent,
                  static_asset_query_generator: LlmAgent,
-                 logo_searcher_llm: DirectToolCallerBaseAgent,
-                 headshot_retriever_llm: DirectToolCallerBaseAgent):
+                 logo_searcher_llm: LlmAgent,
+                 headshot_retriever_llm: LlmAgent):
         super().__init__(
             name=name,
             entity_extractor=entity_extractor,
@@ -741,14 +587,14 @@ class StaticAssetPipelineAgent(BaseAgent):
 class IterativeImageGenerationAgent(BaseAgent):
     model_config = {"arbitrary_types_allowed": True}
     generated_visual_prompts_generator: LlmAgent
-    visual_generator_mcp_caller: DirectToolCallerBaseAgent
+    visual_generator_mcp_caller: LlmAgent
     visual_critic: LlmAgent
     new_visual_prompts_creator: LlmAgent
     max_visual_refinement_loops: int
 
     def __init__(self, name: str,
                  generated_visual_prompts_generator: LlmAgent,
-                 visual_generator_mcp_caller: DirectToolCallerBaseAgent,
+                 visual_generator_mcp_caller: LlmAgent,
                  visual_critic: LlmAgent,
                  new_visual_prompts_creator: LlmAgent,
                  max_visual_refinement_loops: int = 1):
@@ -848,11 +694,11 @@ class IterativeImageGenerationAgent(BaseAgent):
 class VideoPipelineAgent(BaseAgent):
     model_config = {"arbitrary_types_allowed": True}
     veo_prompt_generator: LlmAgent
-    video_generator_mcp_caller: DirectToolCallerBaseAgent
+    video_generator_mcp_caller: LlmAgent # This agent's output_key is "generated_video_clips_uris_json"
 
     def __init__(self, name: str,
                  veo_prompt_generator: LlmAgent,
-                 video_generator_mcp_caller: DirectToolCallerBaseAgent):
+                 video_generator_mcp_caller: LlmAgent):
         super().__init__(
             name=name,
             veo_prompt_generator=veo_prompt_generator,
@@ -952,9 +798,9 @@ class VideoPipelineAgent(BaseAgent):
 ################################################################################
 class TextToSpeechAgent(BaseAgent):
     model_config = {"arbitrary_types_allowed": True}
-    dialogue_to_speech_llm_agent: DirectToolCallerBaseAgent
+    dialogue_to_speech_llm_agent: LlmAgent
 
-    def __init__(self, name: str, dialogue_to_speech_llm_agent: DirectToolCallerBaseAgent):
+    def __init__(self, name: str, dialogue_to_speech_llm_agent: LlmAgent):
         super().__init__(name=name, dialogue_to_speech_llm_agent=dialogue_to_speech_llm_agent, sub_agents=[dialogue_to_speech_llm_agent])
 
     @override
@@ -990,9 +836,9 @@ class TextToSpeechAgent(BaseAgent):
 ################################################################################
 class SpeechToTimestampsAgent(BaseAgent):
     model_config = {"arbitrary_types_allowed": True}
-    audio_to_timestamps_llm_agent: DirectToolCallerBaseAgent
+    audio_to_timestamps_llm_agent: LlmAgent
 
-    def __init__(self, name: str, audio_to_timestamps_llm_agent: DirectToolCallerBaseAgent):
+    def __init__(self, name: str, audio_to_timestamps_llm_agent: LlmAgent):
         super().__init__(name=name, audio_to_timestamps_llm_agent=audio_to_timestamps_llm_agent, sub_agents=[audio_to_timestamps_llm_agent])
 
     @override
@@ -1721,14 +1567,13 @@ TASK:
 For each graph task object in `graph_plotting_instructions_json`:
 1.  Read the `data_to_plot_description` and `source_data_tool_hint`.
 2.  Fetch the precise data needed for the plot using `mlb` tools and the `game_pk`. You might need to process data from `mlb.get_game_boxscore_and_details`, `mlb.get_game_play_by_play_summary`, etc. Transform this data into simple lists suitable for plotting (e.g., a list for x-values, a list for y-values, or a list of series for multi-series plots).
-3. Prepare arguments for `game_plotter_tool.generate_graph`.
-   The `game_pk_str` should be the game PK as a string.
-   The `x_data_json` argument MUST be a STRING containing a JSON array (e.g., `x_data_json = "[1, 2, 3]"`).
-   The `y_data_json` argument MUST be a STRING containing a JSON array (e.g., `y_data_json = "[10, 15, 20]"`).
-   The `data_series_json` argument MUST be a STRING containing a JSON array of series objects (e.g., `data_series_json = "[{\"label\": \"A\", \"y_values\": [1,2]}]"`).
-   The `options_json` argument MUST be a STRING containing a JSON object (e.g., `options_json = "{\"color\":\"blue\"}"`).
-   If any of these data components are not applicable or empty, pass the string "[]" for list types or "{}" for object types.
-   DO NOT pass Python lists or dicts directly as values for these *_json arguments; they must be JSON formatted strings.
+3.  Prepare the arguments for the `game_plotter_tool.generate_graph` tool:
+    *   `game_pk_str`: The game PK as a string.
+    *   `graph_id`, `chart_type`, `title`, `x_axis_label`, `y_axis_label`: Directly from the instruction.
+    *   `x_data_json`: JSON string of the list of x-values.
+    *   `y_data_json`: JSON string of the list of y-values (for single series).
+    *   `data_series_json`: (Use if multiple series) JSON string of a list of series objects, e.g., `[{"label": "TeamA", "y_values": [10,12,15], "x_values": [1,2,3]}]`. If x_values are common, `x_data_json` can be used.
+    *   `options_json` (Optional): JSON string for styling, e.g., `{"color": "green", "marker": "x"}`.
 4.  Call `game_plotter_tool.generate_graph` with these prepared arguments.
 5.  Collect all successfully generated graph details (which include `graph_image_uri`) from the tool responses.
 Your final output MUST be a JSON string list of successfully generated graph asset detail objects. Each object should be the JSON returned by the tool, e.g., `{"status": "success", "graph_id": "...", "graph_image_uri": "gs://...", "title": "...", "type": "generated_graph"}`.
@@ -1738,97 +1583,6 @@ Output ONLY the JSON string list.
         """,
         tools=[*mlb_tools, *game_plotter_tools], # Needs MLB tools and the new plotter tool
         output_key="generated_graph_assets_details_json" # This state key will hold the list of graph asset URIs
-    )
-
-
-   # 3. For Logo Search (replaces LogoSearcherLlm LlmAgent)
-    direct_logo_searcher_agent = DirectToolCallerBaseAgent(
-        name="DirectLogoSearcher",
-        tool_name_to_call="image_embedding_mcp.search_similar_images_by_text", # From your image_embedding_server.py
-        input_state_keys={ # Tool args for search_similar_images_by_text
-            "query_text": "team_name_for_logo_search", # Set by StaticAssetPipelineAgent
-            "top_k": "1", # Will pass None, tool should have default or handle. Or set fixed value.
-            "filter_image_type": "" # Same as above.
-            # For fixed values, we can also hardcode them here if the LlmAgent was doing that.
-            # Or, the LlmAgent that SETS team_name_for_logo_search can also set fixed args for the tool.
-            # Let's assume fixed values are better set by the tool or the agent preparing the call.
-            # For now, we will pass them as None and let the tool handle defaults or error.
-            # A better way: these fixed args should be part of the agent's __init__ or set in state.
-            # Let's modify the DirectToolCaller to allow fixed args.
-        },
-        output_state_key="logo_search_result_json", # StaticAssetPipelineAgent reads this
-        default_output_on_error='"[]"' # Expects a JSON list string
-        # We'll need to enhance DirectToolCallerBaseAgent for fixed args or ensure they are in state.
-    )
-
-    # 4. For Headshot Retrieval (replaces HeadshotRetrieverLlm LlmAgent)
-    direct_headshot_retriever_agent = DirectToolCallerBaseAgent(
-        name="DirectHeadshotRetriever",
-        tool_name_to_call="static_retriever_mcp.get_headshot_uri_if_exists", # From your static_asset_retriever_mcp_server.py
-        input_state_keys={
-            "player_id_str": "player_id_for_headshot_search", # Set by StaticAssetPipelineAgent
-            "player_name_for_log": "player_name_for_headshot_log" # Set by StaticAssetPipelineAgent
-        },
-        output_state_key="headshot_uri_result_json", # StaticAssetPipelineAgent reads this
-        default_output_on_error='{}' # Expects a JSON object string
-    )
-
-    # 1. For Visual Generation (replaces VisualGeneratorMCPCaller LlmAgent)
-    direct_visual_generator_agent = DirectToolCallerBaseAgent(
-        name="DirectVisualGenerator",
-        tool_name_to_call="visual_assets.generate_images_from_prompts", # From your visual_asset_server.py
-        input_state_keys={ # Tool arg name : session state key
-            "prompts": "visual_generation_prompts_json_for_tool", # This state key is set by GeneratedVisualPrompts agent
-            "game_pk_str": "game_pk_str_for_tool"      # This state key is set by IterativeImageGenerationAgent
-        },
-        output_state_key="generated_visual_assets_uris_json", # IterativeImageGenerationAgent reads this
-        default_output_on_error='"[]"' # Expects JSON string of a list
-    )
-
-
-
-    # Update IterativeImageGenerationAgent to use this new agent:
-    iterative_image_generation_agent_instance = IterativeImageGenerationAgent(
-        name="IterativeImageGeneration",
-        generated_visual_prompts_generator=generated_visual_prompts_agent,
-        visual_generator_mcp_caller=direct_visual_generator_agent, # <--- USE NEW AGENT
-        visual_critic=visual_critic_agent,
-        new_visual_prompts_creator=new_visual_prompts_from_critique_agent,
-        max_visual_refinement_loops=1
-    )
-
-    # 2. For Video Generation (replaces VideoGeneratorMCPCaller LlmAgent)
-    direct_video_generator_agent = DirectToolCallerBaseAgent(
-        name="DirectVideoGenerator",
-        tool_name_to_call="video_clip_generator_mcp.generate_video_clips_from_prompts", # From your video_clip_server.py
-        input_state_keys={
-            "prompts": "veo_generation_prompts_json_for_tool", # Set by VeoPromptGenerator agent
-            "game_pk_str": "game_pk_str_for_tool"      # Set by VideoPipelineAgent before this call
-        },
-        output_state_key="generated_video_clips_uris_json", # VideoPipelineAgent reads this
-        default_output_on_error='"[]"'
-    )
-    # 5. For TTS (replaces DialogueToSpeechLlmForGameRecap LlmAgent)
-    direct_tts_agent = DirectToolCallerBaseAgent(
-        name="DirectTTSGenerator",
-        tool_name_to_call="audio_processing_mcp.synthesize_multi_speaker_speech",
-        input_state_keys={
-            "script": "current_recap", # Assuming current_recap is the final script text
-            "game_pk_str": "game_pk"   # Assuming game_pk state holds the string ID or number
-        },
-        output_state_key="generated_dialogue_audio_details_json", # TextToSpeechAgent (BaseAgent wrapper) reads this
-        default_output_on_error='{}'
-    )
-
-    # 6. For STT (replaces AudioToTimestampsLlmForGameRecap LlmAgent)
-    direct_stt_agent = DirectToolCallerBaseAgent(
-        name="DirectSTTGenerator",
-        tool_name_to_call="audio_processing_mcp.get_word_timestamps_from_audio",
-        input_state_keys={
-            "audio_gcs_uri": "generated_dialogue_audio_uri" # Set by TextToSpeechPipeline/DirectTTSGenerator
-        },
-        output_state_key="word_timestamps_json", # SpeechToTimestampsAgent (BaseAgent wrapper) reads this
-        default_output_on_error='"[]"'
     )
 
     graph_generation_pipeline_agent_instance = SequentialAgent(
@@ -1845,22 +1599,29 @@ Output ONLY the JSON string list.
         name="StaticAssetPipeline",
         entity_extractor=entity_extractor_agent,
         static_asset_query_generator=static_asset_query_generator_agent,
-        logo_searcher_llm=direct_logo_searcher_agent, 
-        headshot_retriever_llm=direct_headshot_retriever_agent 
+        logo_searcher_llm=logo_searcher_llm_agent,
+        headshot_retriever_llm=headshot_retriever_llm_agent
     )
-
+    iterative_image_generation_agent_instance = IterativeImageGenerationAgent(
+        name="IterativeImageGeneration",
+        generated_visual_prompts_generator=generated_visual_prompts_agent,
+        visual_generator_mcp_caller=visual_generator_mcp_caller_agent,
+        visual_critic=visual_critic_agent,
+        new_visual_prompts_creator=new_visual_prompts_from_critique_agent,
+        max_visual_refinement_loops=1 # Or your desired value
+    )
     video_pipeline_agent_instance = VideoPipelineAgent(
         name="VideoPipeline",
         veo_prompt_generator=veo_prompt_generator_agent,
-        video_generator_mcp_caller=direct_video_generator_agent
+        video_generator_mcp_caller=video_generator_mcp_caller_agent
     )
     text_to_speech_agent_instance = TextToSpeechAgent( # This is your BaseAgent wrapper
         name="TextToSpeechPipeline",
-        dialogue_to_speech_llm_agent=direct_tts_agent 
+        dialogue_to_speech_llm_agent=dialogue_to_speech_llm_for_audio
     )
     speech_to_timestamps_agent_instance = SpeechToTimestampsAgent( # This is your BaseAgent wrapper
         name="SpeechToTimestampsPipeline",
-        audio_to_timestamps_llm_agent=direct_stt_agent #
+        audio_to_timestamps_llm_agent=audio_to_timestamps_llm_for_audio
     )
 
     # --- Define Workflow Agents for GameRecapAgentV2 ---

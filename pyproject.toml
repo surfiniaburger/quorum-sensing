@@ -23,4 +23,5 @@ dependencies = [
     "ffmpeg>=1.4",
     "audioop-lts>=0.2.1",
     "ffprobe>=0.5",
+    "matplotlib>=3.10.3",
 ]
