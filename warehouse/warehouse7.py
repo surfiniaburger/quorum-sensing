@@ -270,161 +270,119 @@ class QuerySetupAgent(BaseAgent):
 
 
 
-# REVISED DirectToolCallerBaseAgent for better FunctionResponse parsing
 
-# In main.py
 
+
+
+# General Pattern
 class DirectToolCallerBaseAgent(BaseAgent):
-    # Pydantic model_config:
-    # "extra = 'ignore'" (default) means undeclared fields in __init__ are ignored.
-    # "extra = 'allow'" means undeclared fields are allowed and stored on the model.
-    # BaseAgent might have its own model_config. Let's assume it allows additional attributes
-    # or we can set "extra = 'allow'" if needed, though usually not required for attributes
-    # set *after* super().__init__ that are not meant to be Pydantic fields.
-    model_config = {"arbitrary_types_allowed": True, "extra": "allow"} # Let's be explicit
+    model_config = {"arbitrary_types_allowed": True, "extra": "ignore"}
 
-    # These are Pydantic fields, correctly declared:
-    tool_name_to_call: str
-    input_state_keys: Dict[str, str]
-    output_state_key: str
-    default_output_on_error: str
-    fixed_tool_args: Dict[str, Any] = {}
+    tool_name_to_call: str          # Full name of the tool, e.g., "visual_assets.generate_images_from_prompts"
+    input_state_keys: Dict[str, str]  # Maps tool arg names to session state keys providing them
+    output_state_key: str         # Session state key to save the tool's direct JSON payload
+    default_output_on_error: str  # e.g., "[]" or "{}"
 
-    # _internal_llm will NOT be a Pydantic field.
-    # It will be a regular instance attribute.
-    # Remove: _internal_llm: Optional[LlmAgent] = Field(None, exclude=True)
-
-    def __init__(self,
-                 name: str,
-                 tool_name_to_call: str,
-                 input_state_keys: Dict[str, str],
+    def __init__(self, 
+                 name: str, 
+                 tool_name_to_call: str, 
+                 input_state_keys: Dict[str, str], 
                  output_state_key: str,
                  default_output_on_error: str = "{}",
-                 fixed_tool_args: Optional[Dict[str, Any]] = None,
                  **kwargs):
-        super_kwargs = {
-            "name": name,
-            "tool_name_to_call": tool_name_to_call,
-            "input_state_keys": input_state_keys,
-            "output_state_key": output_state_key,
-            "default_output_on_error": default_output_on_error,
-            "fixed_tool_args": fixed_tool_args or {},
+        super().__init__(
+            name=name, 
+            tool_name_to_call=tool_name_to_call,
+            input_state_keys=input_state_keys,
+            output_state_key=output_state_key,
+            default_output_on_error=default_output_on_error,
             **kwargs
-        }
-        super().__init__(**super_kwargs)
+        )
+        # Pydantic will set the attributes
 
-        # Initialize _internal_llm as a standard Python instance attribute
-        # AFTER super().__init__() has completed.
-        # Pydantic will not treat this as one of its fields.
-        self._internal_llm: Optional[LlmAgent] = None
-
-    def _get_or_initialize_internal_llm(self, ctx: InvocationContext) -> Optional[LlmAgent]:
-        if self._internal_llm is None: # Access the instance attribute
-            tool_instance_to_use = None
-            try:
-                tool_instance_to_use = ctx.get_tool(self.tool_name_to_call)
-            except Exception as e:
-                logger.debug(f"[{self.name}] ctx.get_tool for '{self.tool_name_to_call}' failed: {e}. Trying global.")
-            
-            if not tool_instance_to_use:
-                toolset_name, func_name = self.tool_name_to_call.split('.', 1) if '.' in self.tool_name_to_call else (None, None)
-                if toolset_name and func_name and toolset_name in loaded_mcp_tools_global:
-                    for t in loaded_mcp_tools_global[toolset_name]:
-                        tool_name_attr = getattr(t, 'name', None)
-                        decl_name_attr = getattr(t, 'function_declaration', None)
-                        if tool_name_attr == func_name or \
-                           (decl_name_attr and decl_name_attr.name == self.tool_name_to_call):
-                            tool_instance_to_use = t
-                            break
-                if not tool_instance_to_use:
-                    logger.error(f"[{self.name}] Could not find tool instance for '{self.tool_name_to_call}'.")
-                    return None
-            
-            temp_args_state_key = f"temp_tool_args_for_{self.name}_{self.tool_name_to_call.replace('.', '_')}"
-            instruction = f"""Your ONLY task is to make a SINGLE call to the tool named '{self.tool_name_to_call}'.
-All arguments for this tool call are in a dictionary in session state under the key '{temp_args_state_key}'.
-You MUST use these arguments precisely. The tool call will return a JSON string.
-Your entire and final output MUST be ONLY this direct, verbatim JSON string from the tool.
-DO NOT add any other text. If args are missing or invalid, output: "{self.default_output_on_error}"."""
-
-            # Initialize the instance attribute _internal_llm
-            self._internal_llm = LlmAgent(
-                name=f"{self.name}_InternalToolCaller", model=GEMINI_FLASH_MODEL_ID,
-                instruction=instruction, tools=[tool_instance_to_use],
-                output_key=f"temp_result_for_{self.name}_{self.tool_name_to_call.replace('.', '_')}"
-            )
-            logger.info(f"[{self.name}] Initialized internal LlmAgent for '{self.tool_name_to_call}'.")
-        return self._internal_llm # Return the instance attribute
-
-    @override
     async def _run_async_impl(self, ctx: InvocationContext) -> AsyncGenerator[Event, None]:
-        # ... (The rest of this method remains the same as your last working version,
-        #      it will use self._get_or_initialize_internal_llm() which accesses self._internal_llm) ...
-        logger.info(f"[{self.name}] Orchestrating tool call for '{self.tool_name_to_call}'.")
+        logger.info(f"[{self.name}] Preparing to call tool '{self.tool_name_to_call}'.")
         tool_args = {}
-        tool_args.update(self.fixed_tool_args)
+        all_inputs_valid = True
+
         for tool_arg_name, state_key in self.input_state_keys.items():
             value = ctx.session.state.get(state_key)
-            if value is not None: tool_args[tool_arg_name] = value
-            elif tool_arg_name not in tool_args:
-                 logger.warning(f"[{self.name}] Input state key '{state_key}' for '{tool_arg_name}' is None and not in fixed_args.")
-
-        if "prompts" in tool_args and isinstance(tool_args["prompts"], str) and \
-           (self.tool_name_to_call == "visual_assets.generate_images_from_prompts" or \
-            self.tool_name_to_call == "video_clip_generator_mcp.generate_video_clips_from_prompts"):
+            if value is None:
+                # Handle missing optional inputs if necessary, or log warning/error
+                # For simplicity here, we'll assume LlmAgents preparing inputs do their job.
+                # Or, specific callers can have more nuanced logic.
+                logger.warning(f"[{self.name}] Input state key '{state_key}' for tool arg '{tool_arg_name}' not found. Tool call might fail or use defaults.")
+                # If the tool arg is absolutely required by the tool, this should be an error.
+                # For now, we'll let the tool itself potentially fail if a required arg is missing.
+            tool_args[tool_arg_name] = value
+        
+        # Specific type conversions if needed, e.g., JSON string to list/dict for tool
+        # This depends on what the actual MCP tool function expects.
+        # For example, if 'prompts' for generate_images_from_prompts expects a Python list:
+        if "prompts" in tool_args and isinstance(tool_args["prompts"], str):
             try:
                 tool_args["prompts"] = json.loads(_clean_json_string_from_llm(tool_args["prompts"], default_if_empty="[]"))
-                logger.info(f"[{self.name}] Converted 'prompts' from JSON string to list for tool call.")
             except json.JSONDecodeError:
-                logger.error(f"[{self.name}] Failed to parse 'prompts' JSON: {tool_args['prompts']}.")
-                ctx.session.state[self.output_state_key] = self.default_output_on_error
-                yield Event(author=self.name, content=types.Content(role="model", parts=[types.Part(text=f"{self.name}: Failed to parse input prompts.")]))
-                return
-
-        internal_llm = self._get_or_initialize_internal_llm(ctx) # Uses the instance attribute
-        if not internal_llm:
-            logger.error(f"[{self.name}] Failed to initialize internal LlmAgent. Cannot call tool.")
-            ctx.session.state[self.output_state_key] = self.default_output_on_error
-            yield Event(author=self.name, content=types.Content(role="model", parts=[types.Part(text=f"{self.name}: Internal error during setup.")]))
-            return
-
-        temp_args_state_key = f"temp_tool_args_for_{self.name}_{self.tool_name_to_call.replace('.', '_')}"
-        temp_result_state_key = internal_llm.output_key
-
-        ctx.session.state[temp_args_state_key] = tool_args
-        logger.info(f"[{self.name}] Running internal LlmAgent. Args in '{temp_args_state_key}', result to '{temp_result_state_key}'.")
-
-        async for event in internal_llm.run_async(ctx): yield event
-
-        raw_tool_payload_str = ctx.session.state.get(temp_result_state_key, self.default_output_on_error)
-        tool_payload_str = raw_tool_payload_str
-
-        tool_call_successful = True
-        if isinstance(tool_payload_str, str):
-            try:
-                parsed_check = json.loads(tool_payload_str)
-                if isinstance(parsed_check, dict) and "error" in parsed_check:
-                    tool_call_successful = False
-                    logger.warning(f"[{self.name}] Tool call returned an error JSON: {tool_payload_str}")
-            except json.JSONDecodeError:
-                if tool_payload_str != self.default_output_on_error or \
-                   (self.default_output_on_error == "{}" and tool_payload_str != "{}") or \
-                   (self.default_output_on_error == "[]" and tool_payload_str != "[]"):
-                    logger.error(f"[{self.name}] Internal LlmAgent for '{self.tool_name_to_call}' output non-JSON: {tool_payload_str[:200]}...")
-                    tool_call_successful = False
-        else:
-            tool_call_successful = False
-            logger.error(f"[{self.name}] Expected string from internal LlmAgent ('{temp_result_state_key}'), got {type(tool_payload_str)}.")
-            tool_payload_str = self.default_output_on_error
+                logger.error(f"[{self.name}] Failed to parse prompts JSON from state key '{self.input_state_keys.get('prompts')}'. Value: {tool_args['prompts']}")
+                all_inputs_valid = False
         
-        ctx.session.state[self.output_state_key] = tool_payload_str
-        if temp_args_state_key in ctx.session.state: del ctx.session.state[temp_args_state_key]
-        if temp_result_state_key in ctx.session.state: del ctx.session.state[temp_result_state_key]
+        tool_call_successful = False
+        tool_payload_str = self.default_output_on_error
 
-        final_thought = f"{self.name}: Tool '{self.tool_name_to_call}' processed. Output to '{self.output_state_key}'. Success: {tool_call_successful}. Payload: {str(tool_payload_str)[:100]}..."
+        if all_inputs_valid:
+            logger.info(f"[{self.name}] Invoking tool '{self.tool_name_to_call}' with args: { {k: (str(v)[:50] + '...' if isinstance(v, (str, list, dict)) and len(str(v)) > 50 else v) for k,v in tool_args.items()} }")
+
+            # Construct and yield FunctionCall event
+            function_call_event_part = types.Part(function_call=types.FunctionCall(name=self.tool_name_to_call, args=tool_args))
+            yield Event(author=self.name, content=types.Content(parts=[function_call_event_part]))
+
+            # Consume events until we get the FunctionResponse for our call
+            async for event in ctx.agent_tool_orchestrator.run_specific_tool_async(ctx, function_call_event_part.function_call):
+                yield event # Pass through ToolCodeEvent, ToolCompletedEvent, etc.
+                if event.get_function_responses():
+                    for fr in event.get_function_responses():
+                        if fr.name == self.tool_name_to_call:
+                            logger.info(f"[{self.name}] Received FunctionResponse for '{self.tool_name_to_call}'.")
+                            # The fr.response IS the dictionary returned by the tool.
+                            # The ADK/MCP FunctionTool wrapper should ensure this is a dict.
+                            # The actual payload from the MCP server tool (e.g., a JSON string)
+                            # is usually inside fr.response['result']['content'][0]['text'] if it came via FastMCP's default handling.
+                            # Or, if the tool directly returns a dict {"uri": ...}, fr.response would be that.
+                            
+                            response_content = fr.response # This is a dict
+                            if isinstance(response_content, dict) and response_content.get("isError"):
+                                error_message = response_content.get("result", {}).get("content", "Unknown tool error")
+                                if isinstance(error_message, list) and error_message: error_message = error_message[0].get("text", str(error_message))
+                                logger.error(f"[{self.name}] Tool '{self.tool_name_to_call}' reported an error: {error_message}")
+                                tool_payload_str = json.dumps({"error": str(error_message)}) # Save error as JSON
+                            elif isinstance(response_content, dict) and "result" in response_content and \
+                                 isinstance(response_content["result"].get("content"), list) and \
+                                 len(response_content["result"]["content"]) > 0 and \
+                                 isinstance(response_content["result"]["content"][0], dict) and \
+                                 "text" in response_content["result"]["content"][0]:
+                                # This is the common FastMCP structure where tool output is a string in 'text'
+                                tool_payload_str = response_content["result"]["content"][0]["text"]
+                                logger.info(f"[{self.name}] Extracted payload from tool response: {tool_payload_str[:200]}...")
+                            else: # If the response is already the direct payload (e.g. simple FunctionTool not via FastMCP)
+                                logger.warning(f"[{self.name}] Tool response structure not the typical FastMCP one. Using raw response dict. Response: {response_content}")
+                                tool_payload_str = json.dumps(response_content) # Stringify the whole response dict
+
+                            tool_call_successful = not (isinstance(response_content, dict) and response_content.get("isError"))
+                            break # We found our response
+                    if tool_call_successful or tool_payload_str != self.default_output_on_error: # Break outer loop if handled
+                        break
+        else:
+            logger.error(f"[{self.name}] Invalid inputs for tool '{self.tool_name_to_call}'. Skipping call.")
+            # tool_payload_str remains self.default_output_on_error
+
+        ctx.session.state[self.output_state_key] = tool_payload_str # Save the direct JSON string from the tool (or error)
+        
+        final_thought = f"{self.name}: Tool '{self.tool_name_to_call}' processed. Output saved to '{self.output_state_key}'. Success: {tool_call_successful}"
         logger.info(final_thought)
         yield Event(author=self.name, content=types.Content(role="model", parts=[types.Part(text=final_thought)]))
-        
+
+
+
 ################################################################################
 # ---  PlayerIdPopulatorAgent ---
 ################################################################################
@@ -1721,14 +1679,13 @@ TASK:
 For each graph task object in `graph_plotting_instructions_json`:
 1.  Read the `data_to_plot_description` and `source_data_tool_hint`.
 2.  Fetch the precise data needed for the plot using `mlb` tools and the `game_pk`. You might need to process data from `mlb.get_game_boxscore_and_details`, `mlb.get_game_play_by_play_summary`, etc. Transform this data into simple lists suitable for plotting (e.g., a list for x-values, a list for y-values, or a list of series for multi-series plots).
-3. Prepare arguments for `game_plotter_tool.generate_graph`.
-   The `game_pk_str` should be the game PK as a string.
-   The `x_data_json` argument MUST be a STRING containing a JSON array (e.g., `x_data_json = "[1, 2, 3]"`).
-   The `y_data_json` argument MUST be a STRING containing a JSON array (e.g., `y_data_json = "[10, 15, 20]"`).
-   The `data_series_json` argument MUST be a STRING containing a JSON array of series objects (e.g., `data_series_json = "[{\"label\": \"A\", \"y_values\": [1,2]}]"`).
-   The `options_json` argument MUST be a STRING containing a JSON object (e.g., `options_json = "{\"color\":\"blue\"}"`).
-   If any of these data components are not applicable or empty, pass the string "[]" for list types or "{}" for object types.
-   DO NOT pass Python lists or dicts directly as values for these *_json arguments; they must be JSON formatted strings.
+3.  Prepare the arguments for the `game_plotter_tool.generate_graph` tool:
+    *   `game_pk_str`: The game PK as a string.
+    *   `graph_id`, `chart_type`, `title`, `x_axis_label`, `y_axis_label`: Directly from the instruction.
+    *   `x_data_json`: JSON string of the list of x-values.
+    *   `y_data_json`: JSON string of the list of y-values (for single series).
+    *   `data_series_json`: (Use if multiple series) JSON string of a list of series objects, e.g., `[{"label": "TeamA", "y_values": [10,12,15], "x_values": [1,2,3]}]`. If x_values are common, `x_data_json` can be used.
+    *   `options_json` (Optional): JSON string for styling, e.g., `{"color": "green", "marker": "x"}`.
 4.  Call `game_plotter_tool.generate_graph` with these prepared arguments.
 5.  Collect all successfully generated graph details (which include `graph_image_uri`) from the tool responses.
 Your final output MUST be a JSON string list of successfully generated graph asset detail objects. Each object should be the JSON returned by the tool, e.g., `{"status": "success", "graph_id": "...", "graph_image_uri": "gs://...", "title": "...", "type": "generated_graph"}`.
