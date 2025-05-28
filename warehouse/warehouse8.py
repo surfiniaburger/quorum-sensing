@@ -68,6 +68,8 @@ APP_NAME = "ADK_MCP_App_Parallel" # Changed to reflect new structure
 MODEL_ID = "gemini-2.0-flash"
 GEMINI_PRO_MODEL_ID = "gemini-2.5-pro-preview-05-06"
 GEMINI_FLASH_MODEL_ID="gemini-2.5-flash-preview-04-17" # Ensure correct new name
+GEMMA = "gemma-3-27b-it"
+
 STATIC_DIR = "static"
 
 session_service = InMemorySessionService()
@@ -273,27 +275,18 @@ class QuerySetupAgent(BaseAgent):
 
 # REVISED DirectToolCallerBaseAgent for better FunctionResponse parsing
 
-# In main.py
-
 class DirectToolCallerBaseAgent(BaseAgent):
-    # Pydantic model_config:
-    # "extra = 'ignore'" (default) means undeclared fields in __init__ are ignored.
-    # "extra = 'allow'" means undeclared fields are allowed and stored on the model.
-    # BaseAgent might have its own model_config. Let's assume it allows additional attributes
-    # or we can set "extra = 'allow'" if needed, though usually not required for attributes
-    # set *after* super().__init__ that are not meant to be Pydantic fields.
-    model_config = {"arbitrary_types_allowed": True, "extra": "allow"} # Let's be explicit
+    model_config = {"arbitrary_types_allowed": True, "extra": "allow"} # Allow instance attributes
 
-    # These are Pydantic fields, correctly declared:
+    # These ARE Pydantic fields, correctly declared:
     tool_name_to_call: str
     input_state_keys: Dict[str, str]
     output_state_key: str
     default_output_on_error: str
-    fixed_tool_args: Dict[str, Any] = {}
+    fixed_tool_args: Dict[str, Any] # Will default to {} if not provided in __init__ and passed to super
 
-    # _internal_llm will NOT be a Pydantic field.
-    # It will be a regular instance attribute.
-    # Remove: _internal_llm: Optional[LlmAgent] = Field(None, exclude=True)
+    # _internal_llm_instance is NOT a Pydantic field.
+    # Remove: _internal_llm_instance: Optional[LlmAgent] = Field(None, exclude=True)
 
     def __init__(self,
                  name: str,
@@ -309,129 +302,142 @@ class DirectToolCallerBaseAgent(BaseAgent):
             "input_state_keys": input_state_keys,
             "output_state_key": output_state_key,
             "default_output_on_error": default_output_on_error,
-            "fixed_tool_args": fixed_tool_args or {},
+            "fixed_tool_args": fixed_tool_args or {}, # Ensure it's a dict for Pydantic field
             **kwargs
         }
         super().__init__(**super_kwargs)
 
-        # Initialize _internal_llm as a standard Python instance attribute
-        # AFTER super().__init__() has completed.
-        # Pydantic will not treat this as one of its fields.
-        self._internal_llm: Optional[LlmAgent] = None
+        # Initialize _internal_llm_instance as a standard Python instance attribute
+        # AFTER super().__init__() has completed. Pydantic will not manage this.
+        self._internal_llm_instance: Optional[LlmAgent] = None
 
     def _get_or_initialize_internal_llm(self, ctx: InvocationContext) -> Optional[LlmAgent]:
-        if self._internal_llm is None: # Access the instance attribute
+        if self._internal_llm_instance is None: # Access the instance attribute
             tool_instance_to_use = None
             try:
                 tool_instance_to_use = ctx.get_tool(self.tool_name_to_call)
+                if tool_instance_to_use: logger.info(f"[{self.name}] Tool '{self.tool_name_to_call}' found via ctx.get_tool().")
             except Exception as e:
                 logger.debug(f"[{self.name}] ctx.get_tool for '{self.tool_name_to_call}' failed: {e}. Trying global.")
             
             if not tool_instance_to_use:
                 toolset_name, func_name = self.tool_name_to_call.split('.', 1) if '.' in self.tool_name_to_call else (None, None)
                 if toolset_name and func_name and toolset_name in loaded_mcp_tools_global:
-                    for t in loaded_mcp_tools_global[toolset_name]:
-                        tool_name_attr = getattr(t, 'name', None)
-                        decl_name_attr = getattr(t, 'function_declaration', None)
-                        if tool_name_attr == func_name or \
-                           (decl_name_attr and decl_name_attr.name == self.tool_name_to_call):
-                            tool_instance_to_use = t
+                    for t_obj in loaded_mcp_tools_global[toolset_name]:
+                        t_name = getattr(t_obj, 'name', None)
+                        f_decl = getattr(t_obj, 'function_declaration', None)
+                        f_decl_name = getattr(f_decl, 'name', None)
+                        if t_name == func_name or f_decl_name == self.tool_name_to_call:
+                            tool_instance_to_use = t_obj
+                            logger.info(f"[{self.name}] Tool '{self.tool_name_to_call}' found via global_mcp_tools.")
                             break
                 if not tool_instance_to_use:
-                    logger.error(f"[{self.name}] Could not find tool instance for '{self.tool_name_to_call}'.")
+                    logger.error(f"[{self.name}] CRITICAL: Tool '{self.tool_name_to_call}' could not be found.")
                     return None
             
             temp_args_state_key = f"temp_tool_args_for_{self.name}_{self.tool_name_to_call.replace('.', '_')}"
-            instruction = f"""
-our ONLY task is to make a SINGLE call to the tool named '{self.tool_name_to_call}'.
-All arguments for this tool call are in a dictionary in session state under the key '{temp_args_state_key}'.
-You MUST use these arguments precisely.
-The tool named '{self.tool_name_to_call}' will execute and provide its complete, raw JSON string output directly to you as part of its function response.
-Your entire and final textual output for this interaction MUST BE this exact, verbatim JSON string that the tool provided.
-For example, if the tool returns the JSON string `"[{{\\"uri\\": \\"gs://example.png\\"}}]"` then your output MUST be exactly that string: `"[{{\\"uri\\": \\"gs://example.png\\"}}]"`
-DO NOT summarize, explain, add "Okay", or change the tool's JSON string output in any way.
-If the tool call results in an error being returned by the tool itself (as a JSON error string), your output should be that error JSON string.
-If the input arguments in '{temp_args_state_key}' are missing or clearly invalid for the tool, your output MUST be the exact JSON string: "{self.default_output_on_error}".
-"""
+            instruction = f"""Your only task is to call the tool named '{self.tool_name_to_call}'.
+All arguments for this tool call are provided in a dictionary in session state under the key '{temp_args_state_key}'.
+Use these arguments precisely for the tool call. You do not need to provide any other text or summarization.
+If the arguments in '{temp_args_state_key}' are missing or you believe they are invalid for the tool, output a brief message stating an error occurred.
+Otherwise, after the tool call is complete, output a brief confirmation like "Tool {self.tool_name_to_call} called."
+""" # This LlmAgent's textual output is not critical as we parse the FunctionResponse.
 
-            # Initialize the instance attribute _internal_llm
-            self._internal_llm = LlmAgent(
-                name=f"{self.name}_InternalToolCaller", model=GEMINI_PRO_MODEL_ID,
-                instruction=instruction, tools=[tool_instance_to_use],
-                output_key=f"temp_result_for_{self.name}_{self.tool_name_to_call.replace('.', '_')}"
+            # Initialize the instance attribute _internal_llm_instance
+            self._internal_llm_instance = LlmAgent(
+                name=f"{self.name}_InternalCaller", model=GEMINI_FLASH_MODEL_ID,
+                instruction=instruction, tools=[tool_instance_to_use]
+                # No output_key for this internal LLM; we'll get the tool's output from its FunctionResponse event.
             )
-            logger.info(f"[{self.name}] Initialized internal LlmAgent for '{self.tool_name_to_call}'.")
-        return self._internal_llm # Return the instance attribute
+            logger.info(f"[{self.name}] Initialized internal LlmAgent '{self._internal_llm_instance.name}'.")
+        return self._internal_llm_instance # Return the instance attribute
 
     @override
     async def _run_async_impl(self, ctx: InvocationContext) -> AsyncGenerator[Event, None]:
-        # ... (The rest of this method remains the same as your last working version,
-        #      it will use self._get_or_initialize_internal_llm() which accesses self._internal_llm) ...
-        logger.info(f"[{self.name}] Orchestrating tool call for '{self.tool_name_to_call}'.")
+        logger.info(f"[{self.name}] Orchestrating tool call for '{self.tool_name_to_call}' (Event Parsing V3).")
         tool_args = {}
         tool_args.update(self.fixed_tool_args)
         for tool_arg_name, state_key in self.input_state_keys.items():
             value = ctx.session.state.get(state_key)
             if value is not None: tool_args[tool_arg_name] = value
-            elif tool_arg_name not in tool_args:
-                 logger.warning(f"[{self.name}] Input state key '{state_key}' for '{tool_arg_name}' is None and not in fixed_args.")
+            elif tool_arg_name not in tool_args: logger.warning(f"[{self.name}] Input '{state_key}' for '{tool_arg_name}' is None.")
 
-        if "prompts" in tool_args and isinstance(tool_args["prompts"], str) and \
-           (self.tool_name_to_call == "visual_assets.generate_images_from_prompts" or \
-            self.tool_name_to_call == "video_clip_generator_mcp.generate_video_clips_from_prompts"):
+        is_prompt_tool = self.tool_name_to_call.endswith("generate_images_from_prompts") or \
+                         self.tool_name_to_call.endswith("generate_video_clips_from_prompts")
+        if "prompts" in tool_args and isinstance(tool_args["prompts"], str) and is_prompt_tool:
             try:
                 tool_args["prompts"] = json.loads(_clean_json_string_from_llm(tool_args["prompts"], default_if_empty="[]"))
-                logger.info(f"[{self.name}] Converted 'prompts' from JSON string to list for tool call.")
             except json.JSONDecodeError:
-                logger.error(f"[{self.name}] Failed to parse 'prompts' JSON: {tool_args['prompts']}.")
+                logger.error(f"[{self.name}] Failed 'prompts' JSON parse. Tool: {self.tool_name_to_call}, Val: {tool_args['prompts']}")
                 ctx.session.state[self.output_state_key] = self.default_output_on_error
-                yield Event(author=self.name, content=types.Content(role="model", parts=[types.Part(text=f"{self.name}: Failed to parse input prompts.")]))
+                yield Event(author=self.name, content=types.Content(role="model", parts=[types.Part(text=f"{self.name}: Bad prompts input.")]))
                 return
 
-        internal_llm = self._get_or_initialize_internal_llm(ctx) # Uses the instance attribute
+        internal_llm = self._get_or_initialize_internal_llm(ctx)
         if not internal_llm:
-            logger.error(f"[{self.name}] Failed to initialize internal LlmAgent. Cannot call tool.")
             ctx.session.state[self.output_state_key] = self.default_output_on_error
-            yield Event(author=self.name, content=types.Content(role="model", parts=[types.Part(text=f"{self.name}: Internal error during setup.")]))
+            yield Event(author=self.name, content=types.Content(role="model", parts=[types.Part(text=f"{self.name}: Internal LLM init error for {self.tool_name_to_call}.")]))
             return
 
         temp_args_state_key = f"temp_tool_args_for_{self.name}_{self.tool_name_to_call.replace('.', '_')}"
-        temp_result_state_key = internal_llm.output_key
-
         ctx.session.state[temp_args_state_key] = tool_args
-        logger.info(f"[{self.name}] Running internal LlmAgent. Args in '{temp_args_state_key}', result to '{temp_result_state_key}'.")
-
-        async for event in internal_llm.run_async(ctx): yield event
-
-        raw_tool_payload_str = ctx.session.state.get(temp_result_state_key, self.default_output_on_error)
-        tool_payload_str = raw_tool_payload_str
-
-        tool_call_successful = True
-        if isinstance(tool_payload_str, str):
-            try:
-                parsed_check = json.loads(tool_payload_str)
-                if isinstance(parsed_check, dict) and "error" in parsed_check:
-                    tool_call_successful = False
-                    logger.warning(f"[{self.name}] Tool call returned an error JSON: {tool_payload_str}")
-            except json.JSONDecodeError:
-                if tool_payload_str != self.default_output_on_error or \
-                   (self.default_output_on_error == "{}" and tool_payload_str != "{}") or \
-                   (self.default_output_on_error == "[]" and tool_payload_str != "[]"):
-                    logger.error(f"[{self.name}] Internal LlmAgent for '{self.tool_name_to_call}' output non-JSON: {tool_payload_str[:200]}...")
-                    tool_call_successful = False
-        else:
-            tool_call_successful = False
-            logger.error(f"[{self.name}] Expected string from internal LlmAgent ('{temp_result_state_key}'), got {type(tool_payload_str)}.")
-            tool_payload_str = self.default_output_on_error
         
+        tool_payload_str = self.default_output_on_error
+        tool_call_successful = False
+        function_response_processed = False
+
+        logger.info(f"[{self.name}] Running internal LlmAgent '{internal_llm.name}' to request tool '{self.tool_name_to_call}'. Args in '{temp_args_state_key}'.")
+        
+        async for event in internal_llm.run_async(ctx):
+            yield event
+            if event.get_function_responses():
+                for fr in event.get_function_responses():
+                    if fr.name == self.tool_name_to_call:
+                        function_response_processed = True
+                        logger.info(f"[{self.name}] Captured FunctionResponse for '{self.tool_name_to_call}'.")
+                        response_dict = fr.response
+                        
+                        if isinstance(response_dict, dict) and response_dict.get("isError"):
+                            error_content_list = response_dict.get("result", {}).get("content", [])
+                            actual_error_msg = "Unknown tool error"
+                            if isinstance(error_content_list, list) and error_content_list and isinstance(error_content_list[0], dict):
+                                actual_error_msg = error_content_list[0].get("text", str(error_content_list))
+                            logger.error(f"[{self.name}] Tool '{self.tool_name_to_call}' execution resulted in an error: {actual_error_msg}")
+                            tool_payload_str = json.dumps({"error": actual_error_msg})
+                            tool_call_successful = False
+                        elif isinstance(response_dict, dict) and "result" in response_dict and \
+                             isinstance(response_dict["result"].get("content"), list) and \
+                             len(response_dict["result"]["content"]) > 0 and \
+                             isinstance(response_dict["result"]["content"][0], dict) and \
+                             "text" in response_dict["result"]["content"][0]:
+                            tool_payload_str = response_dict["result"]["content"][0]["text"]
+                            logger.info(f"[{self.name}] Extracted payload (FastMCP style) for '{self.tool_name_to_call}': {tool_payload_str[:200]}...")
+                            tool_call_successful = True
+                        elif isinstance(response_dict, dict):
+                            logger.info(f"[{self.name}] Tool '{self.tool_name_to_call}' returned direct dict: {str(response_dict)[:200]}...")
+                            tool_payload_str = json.dumps(response_dict)
+                            tool_call_successful = True
+                        else:
+                            logger.error(f"[{self.name}] Tool response for '{self.tool_name_to_call}' had unexpected structure: {response_dict}")
+                            tool_payload_str = json.dumps({"error": "Unexpected tool response structure", "details": str(response_dict)[:200]})
+                            tool_call_successful = False
+                        break 
+            if function_response_processed:
+                break 
+
+        if not function_response_processed:
+            logger.warning(f"[{self.name}] No FunctionResponse event captured from internal LlmAgent for tool '{self.tool_name_to_call}'.")
+            tool_call_successful = False
+
         ctx.session.state[self.output_state_key] = tool_payload_str
         if temp_args_state_key in ctx.session.state: del ctx.session.state[temp_args_state_key]
-        if temp_result_state_key in ctx.session.state: del ctx.session.state[temp_result_state_key]
 
-        final_thought = f"{self.name}: Tool '{self.tool_name_to_call}' processed. Output to '{self.output_state_key}'. Success: {tool_call_successful}. Payload: {str(tool_payload_str)[:100]}..."
+        final_thought = (f"{self.name}: Orchestration for tool '{self.tool_name_to_call}' complete. "
+                         f"Output set to '{self.output_state_key}'. Tool call successful based on FunctionResponse: {tool_call_successful}. "
+                         f"Payload start: {str(tool_payload_str)[:100]}...")
         logger.info(final_thought)
         yield Event(author=self.name, content=types.Content(role="model", parts=[types.Part(text=final_thought)]))
-        
+
 ################################################################################
 # ---  PlayerIdPopulatorAgent ---
 ################################################################################
@@ -959,9 +965,9 @@ class VideoPipelineAgent(BaseAgent):
 ################################################################################
 class TextToSpeechAgent(BaseAgent):
     model_config = {"arbitrary_types_allowed": True}
-    dialogue_to_speech_llm_agent: DirectToolCallerBaseAgent
+    dialogue_to_speech_llm_agent: LlmAgent
 
-    def __init__(self, name: str, dialogue_to_speech_llm_agent: DirectToolCallerBaseAgent):
+    def __init__(self, name: str, dialogue_to_speech_llm_agent: LlmAgent):
         super().__init__(name=name, dialogue_to_speech_llm_agent=dialogue_to_speech_llm_agent, sub_agents=[dialogue_to_speech_llm_agent])
 
     @override
@@ -997,9 +1003,9 @@ class TextToSpeechAgent(BaseAgent):
 ################################################################################
 class SpeechToTimestampsAgent(BaseAgent):
     model_config = {"arbitrary_types_allowed": True}
-    audio_to_timestamps_llm_agent: DirectToolCallerBaseAgent
+    audio_to_timestamps_llm_agent: LlmAgent
 
-    def __init__(self, name: str, audio_to_timestamps_llm_agent: DirectToolCallerBaseAgent):
+    def __init__(self, name: str, audio_to_timestamps_llm_agent: LlmAgent):
         super().__init__(name=name, audio_to_timestamps_llm_agent=audio_to_timestamps_llm_agent, sub_agents=[audio_to_timestamps_llm_agent])
 
     @override
@@ -1863,11 +1869,11 @@ Output ONLY the JSON string list.
     )
     text_to_speech_agent_instance = TextToSpeechAgent( # This is your BaseAgent wrapper
         name="TextToSpeechPipeline",
-        dialogue_to_speech_llm_agent=direct_tts_agent 
+        dialogue_to_speech_llm_agent=dialogue_to_speech_llm_for_audio 
     )
     speech_to_timestamps_agent_instance = SpeechToTimestampsAgent( # This is your BaseAgent wrapper
         name="SpeechToTimestampsPipeline",
-        audio_to_timestamps_llm_agent=direct_stt_agent #
+        audio_to_timestamps_llm_agent=audio_to_timestamps_llm_for_audio #
     )
 
     # --- Define Workflow Agents for GameRecapAgentV2 ---
@@ -1945,7 +1951,7 @@ Output ONLY the JSON string list.
         sub_agents=[
             script_generation_pipeline_instance,
             parallel_asset_pipelines_instance,
-            asset_validator_instance,
+            #asset_validator_instance,
             asset_aggregator_agent_instance # NEW: Use this as the final step
         ],
         description="Orchestrates game recap, asset creation/validation, and final asset aggregation."
