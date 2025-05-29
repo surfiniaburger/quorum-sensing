@@ -25,10 +25,6 @@ from google.adk.events import Event
 from pydantic import BaseModel, Field
 from starlette.websockets import WebSocketDisconnect
 from voice_agent import router as voice_agent_router # Assuming this exists
-import hashlib # For task ID generation if not already there
-from google.adk.tools import LongRunningFunctionTool
-from adk_native.long_running_image_ops import initiate_image_generation, IMAGE_GENERATION_TASKS
-from adk_native.long_running_video_ops import initiate_video_generation, VIDEO_GENERATION_TASKS
 import logging
 
 
@@ -107,13 +103,6 @@ server_configs_instance = AllServerConfigs(
         "game_plotter_tool": game_plotter_tool_params
     }
 )
-
-
-# --- Define LongRunningFunctionTool instances ---
-long_running_image_tool = LongRunningFunctionTool(func=initiate_image_generation)
-long_running_video_tool = LongRunningFunctionTool(func=initiate_video_generation)
-
-
 
 # --- Agent Instructions (Copied) ---
 ROOT_AGENT_INSTRUCTION = """
@@ -753,240 +742,215 @@ class StaticAssetPipelineAgent(BaseAgent):
             )
         )
 
+################################################################################
+# --- PHASE 2: IterativeImageGenerationAgent (Copied - Assumed Correct) ---
+################################################################################
+class IterativeImageGenerationAgent(BaseAgent):
+    model_config = {"arbitrary_types_allowed": True}
+    generated_visual_prompts_generator: LlmAgent
+    visual_generator_mcp_caller: DirectToolCallerBaseAgent
+    visual_critic: LlmAgent
+    new_visual_prompts_creator: LlmAgent
+    max_visual_refinement_loops: int
 
-    # IterativeImageGenerationAgent will now orchestrate these and the subsequent critique/refinement.
-    # It needs to handle the asynchronous nature of the LR tool completion.
-    # For simplicity, we'll assume the "agent client" handles polling, and this agent
-    # picks up the result from a known state key once the FunctionResponse is processed.
-    # A more robust CustomAgent would be needed for intricate internal polling and state management
-    # if the agent client wasn't handling it.
+    def __init__(self, name: str,
+                 generated_visual_prompts_generator: LlmAgent,
+                 visual_generator_mcp_caller: DirectToolCallerBaseAgent,
+                 visual_critic: LlmAgent,
+                 new_visual_prompts_creator: LlmAgent,
+                 max_visual_refinement_loops: int = 1):
+        super().__init__(
+            name=name,
+            generated_visual_prompts_generator=generated_visual_prompts_generator,
+            visual_generator_mcp_caller=visual_generator_mcp_caller,
+            visual_critic=visual_critic,
+            new_visual_prompts_creator=new_visual_prompts_creator,
+            max_visual_refinement_loops=max_visual_refinement_loops,
+            sub_agents=[generated_visual_prompts_generator, visual_generator_mcp_caller, visual_critic, new_visual_prompts_creator]
+        )
 
-    # visual_critic_agent and new_visual_prompts_from_critique_agent remain the same LlmAgents.
+    @override
+    async def _run_async_impl(self, ctx: InvocationContext) -> AsyncGenerator[Event, None]:
+        logger.info(f"[{self.name}] Starting iterative image generation workflow.")
+        ctx.session.state["all_generated_image_assets_details"] = []
 
-    # REVISED IterativeImageGenerationAgent (now a SequentialAgent for clarity of flow)
-    # The loop logic for refinement would be handled by the overarching GameRecapAgentV2 or a LoopAgent within.
-    # For now, let's assume ONE round of generation + critique for this refactoring.
-    # The original IterativeImageGenerationAgent had a loop; this needs careful thought.
-    # Let's make it a sequence for one pass, and the "agent client" handles the LR part.
-    # The loop from the original IterativeImageGenerationAgent is complex with an external polling mechanism.
-    # We will simplify: Generate -> Client Polls -> Result in state -> Critique -> New Prompts.
-    # The *retry/refinement* loop part of IterativeImageGenerationAgent is harder with LR tools
-    # if the agent itself isn't the one doing the polling and reacting.
+        if not ctx.session.state.get("current_recap"):
+            logger.warning(f"[{self.name}] 'current_recap' missing. Skipping image generation.")
+            yield Event(author=self.name, type="agent_thought", content=types.Content(role="model", parts=[types.Part(text="Iterative image generation skipped: no recap.")]))
+            return
 
-    # Let's define a new Custom Agent for the iterative image part.
-    class ADKNativeIterativeImageGenerationAgent(BaseAgent): # Inherit from BaseAgent for custom logic
-        model_config = {"arbitrary_types_allowed": True}
-        prompt_generator: LlmAgent
-        lr_tool_caller: LlmAgent # Calls the LongRunningFunctionTool
-        visual_critic: LlmAgent
-        new_prompts_creator: LlmAgent
-        max_refinement_loops: int
+        async for event in self.generated_visual_prompts_generator.run_async(ctx): yield event
+        current_prompts_json_for_next_iteration = _clean_json_string_from_llm(ctx.session.state.get("visual_generation_prompts_json", "[]"))
+        all_generated_assets_details_for_this_agent = []
 
-        # Key where the LlmAgent (lr_tool_caller) will eventually store the *final result*
-        # of the long-running image generation after the client injects the FunctionResponse.
-        LR_IMAGE_RESULT_STATE_KEY: str = "generated_visual_assets_uris_json_from_lr"
+        for i in range(self.max_visual_refinement_loops + 1):
+            iteration_label = f"Iteration {i+1}/{self.max_visual_refinement_loops + 1}"
+            prompts_to_use_this_iteration_str = current_prompts_json_for_next_iteration
+            current_prompts_list_for_iter = []
+            try:
+                parsed_list = json.loads(prompts_to_use_this_iteration_str)
+                if isinstance(parsed_list, list) and parsed_list:
+                    current_prompts_list_for_iter = [str(p) for p in parsed_list if isinstance(p, str) and p] # Ensure non-empty strings
+                    if not current_prompts_list_for_iter: raise ValueError("Prompt list became empty after filtering.")
+                else:
+                    break
+            except (json.JSONDecodeError, ValueError) as e:
+                logger.error(f"[{self.name}] Invalid JSON/content for prompts in {iteration_label}. Error: {e}. JSON: '{prompts_to_use_this_iteration_str}'.")
+                break
 
+            ctx.session.state['visual_generation_prompts_json_for_tool'] = json.dumps(current_prompts_list_for_iter) # Use the validated list
+            ctx.session.state['game_pk_str_for_tool'] = str(ctx.session.state.get("game_pk", "unknown_game"))
 
-        def __init__(self, name: str,
-                     prompt_generator: LlmAgent,
-                     lr_tool_caller: LlmAgent,
-                     visual_critic: LlmAgent,
-                     new_prompts_creator: LlmAgent,
-                     max_visual_refinement_loops: int = 1):
-            super().__init__(
-                name=name,
-                prompt_generator=prompt_generator,
-                lr_tool_caller=lr_tool_caller,
-                visual_critic=visual_critic,
-                new_prompts_creator=new_prompts_creator,
-                max_visual_refinement_loops=max_visual_refinement_loops,
-                # Sub-agents for ADK framework visibility.
-                # The actual calls will be managed in _run_async_impl
-                sub_agents=[prompt_generator, lr_tool_caller, visual_critic, new_prompts_creator]
-            )
+            async for event in self.visual_generator_mcp_caller.run_async(ctx): yield event
+            tool_output_json_string_clean = _clean_json_string_from_llm(ctx.session.state.get("generated_visual_assets_uris_json", '"[]"'), default_if_empty='"[]"')
+            generated_uris_this_iter = []
+            tool_had_error_flag = False
+            try:
+                parsed_tool_output_content = json.loads(tool_output_json_string_clean)
+                if isinstance(parsed_tool_output_content, list):
+                    generated_uris_this_iter = [uri for uri in parsed_tool_output_content if isinstance(uri, str) and uri.startswith("gs://")]
+                elif isinstance(parsed_tool_output_content, dict) and parsed_tool_output_content.get("error"):
+                    tool_had_error_flag = True
+                # Simplified, assuming secondary parse logic is in your _clean_json_string_from_llm or tool output is now more consistent
+            except json.JSONDecodeError as e:
+                tool_had_error_flag = True
 
-        @override
-        async def _run_async_impl(self, ctx: InvocationContext) -> AsyncGenerator[Event, None]:
-            logger.info(f"[{self.name}] Starting ADK-native iterative image generation workflow.")
-            ctx.session.state["all_generated_image_assets_details"] = [] # Final list for this agent
-            
-            # Ensure game_pk is available for the tool caller
-            if "game_pk" not in ctx.session.state: # Assuming game_pk is set by an earlier agent
-                logger.warning(f"[{self.name}] 'game_pk' missing. Image generation might have issues with naming.")
-                ctx.session.state["game_pk"] = "unknown_game_for_image_lr"
+            assets_for_critique_this_iteration = []
+            if not current_prompts_list_for_iter: continue
 
-
-            # Initial prompt generation
-            logger.info(f"[{self.name}] Running GeneratedVisualPromptsForLR...")
-            async for event in self.prompt_generator.run_async(ctx): yield event
-            
-            current_prompts_json_for_tool = ctx.session.state.get("visual_generation_prompts_json", "[]")
-            if not current_prompts_json_for_tool or current_prompts_json_for_tool == "[]":
-                logger.info(f"[{self.name}] No visual prompts generated. Skipping image generation loop.")
-                yield Event(author=self.name, content=types.Content(role="model", parts=[types.Part(text="No image prompts, skipping generation.")]))
-                return
-
-            all_generated_assets_details_for_this_agent = []
-
-            for i in range(self.max_visual_refinement_loops + 1): # +1 for initial generation
-                iteration_label = f"Refinement Iteration {i}" if i > 0 else "Initial Generation"
-                logger.info(f"[{self.name}] {iteration_label} - Loop {i+1}/{self.max_visual_refinement_loops + 1}")
-
-                # State key for prompts for the LR tool caller might need to be distinct per iteration if prompts change
-                # For now, visual_generation_prompts_json is updated by new_prompts_creator for next iter
-                ctx.session.state["visual_generation_prompts_json_for_lr_tool_caller"] = current_prompts_json_for_tool
-
-                logger.info(f"[{self.name}] Running ImageGenerationLRToolCaller for prompts: {current_prompts_json_for_tool[:100]}...")
-                # This call will make the LlmAgent call the LongRunningFunctionTool.
-                # The LlmAgent will then PAUSE, and this ADKNativeIterativeImageGenerationAgent will also pause.
-                # The "agent client" (e.g. in main.py) must now poll for the task_id given by the LRFT's initial response
-                # and inject the FunctionResponse.
-                async for event in self.lr_tool_caller.run_async(ctx):
-                    yield event
-                    # We expect lr_tool_caller to set "image_generation_lr_task_submission_details"
-                    # with {"status": "pending_agent_client_action", "task_id": ..., "tool_name": ...}
-                    # The actual result (URIs) will only be available *after* the client polls and injects a FunctionResponse.
-                    # That FunctionResponse will be processed by the lr_tool_caller LlmAgent in a *subsequent* agent run pass,
-                    # and it will then write its final output (the URIs) to its output_key.
-
-                # === This is the tricky part with LongRunningFunctionTool and agent-internal loops ===
-                # The agent is PAUSED HERE until the client injects the FunctionResponse.
-                # When the agent RESUMES, the lr_tool_caller would have processed the FunctionResponse.
-                # The result of the LR tool (the image URIs) will be in lr_tool_caller.output_key.
-                # We need a way for this _run_async_impl to "wait" or be re-entered after the LRFT completes.
-
-                # Let's assume that when this agent resumes, the result is in `image_generation_lr_task_submission_details`
-                # NO, the LlmAgent `lr_tool_caller`'s output_key will hold the final FunctionResponse content.
-                # Let `lr_tool_caller.output_key` be `lr_image_tool_final_output`.
+            for idx, prompt_text in enumerate(current_prompts_list_for_iter):
+                asset_uri = generated_uris_this_iter[idx] if idx < len(generated_uris_this_iter) else None
+                if tool_had_error_flag and not asset_uri : asset_uri = None # Ensure null if tool error and no URI for this prompt
                 
-                # This agent's `_run_async_impl` will complete its current iteration after yielding events from `lr_tool_caller`.
-                # The `GameRecapAgentV2` will resume, and if it's a `SequentialAgent`, it will proceed to the next agent *or*
-                # if the `ADKNativeIterativeImageGenerationAgent` is the one looping, its `_run_async_impl` needs to be
-                # re-entrant or designed as a state machine.
+                assets_for_critique_this_iteration.append({"prompt_origin": prompt_text, "image_uri": asset_uri, "type": "generated_image"})
+                if asset_uri:
+                    all_generated_assets_details_for_this_agent.append({
+                        "prompt_origin": prompt_text, "image_uri": asset_uri,
+                        "type": "generated_image", "iteration": i + 1
+                    })
 
-                # For strict adherence to LRFT doc: Agent calls LRFT -> Agent PAUSES -> Client polls & injects FunctionResponse -> Agent RESUMES.
-                # The loop for refinement must happen *after* the image generation is fully resolved.
+            ctx.session.state["assets_for_critique_json"] = json.dumps(assets_for_critique_this_iteration)
+            ctx.session.state["prompts_used_for_critique_json"] = json.dumps(current_prompts_list_for_iter) # Use the validated list
 
-                # Let's adjust the design:
-                # 1. ImagePromptGeneratorAgent
-                # 2. ImageGenerationLRToolCallerAgent (calls LRFT, pauses)
-                # --- External Client Polling and FunctionResponse Injection ---
-                # (Agent resumes, ImageGenerationLRToolCallerAgent now has the image URIs in its output_key)
-                # 3. ImageResultCollectorAgent (A simple BaseAgent to take output from ImageGenerationLRToolCallerAgent.output_key
-                #    and place it into `assets_for_critique_json` and `all_generated_image_assets_details`).
-                # 4. VisualCriticAgent
-                # 5. NewVisualPromptsCreatorAgent (updates `visual_generation_prompts_json` for the next loop iteration)
-                # These 5 steps would be inside a LoopAgent.
+            if i >= self.max_visual_refinement_loops: break
 
-                # This means `ADKNativeIterativeImageGenerationAgent` should be a `LoopAgent` itself,
-                # or orchestrated by one. The `_run_async_impl` cannot directly manage a loop
-                # that depends on an externally completed LRFT within the same continuous flow.
+            async for event in self.visual_critic.run_async(ctx): yield event
+            critique_text = ctx.session.state.get("visual_critique_text", "")
+            if "sufficient" in critique_text.lower(): break
 
-                # Simplified: For THIS iteration of the refactor, the iterative loop for IMAGE generation
-                # will be removed. It will be: GenPrompts -> CallLRFT -> (Client Polls & Responds) -> Agent gets URI -> Critique (once).
-                # The `max_refinement_loops` will effectively be 0 for the LR part.
-                # The critique part will run once after the first batch of images.
+            async for event in self.new_visual_prompts_creator.run_async(ctx): yield event
+            current_prompts_json_for_next_iteration = _clean_json_string_from_llm(ctx.session.state.get("new_visual_generation_prompts_json", "[]"))
+            try:
+                if not json.loads(current_prompts_json_for_next_iteration): break
+            except: break
 
-                # When this ADKNativeIterativeImageGenerationAgent's _run_async_impl is called AGAIN by the runner
-                # (after the LRFT's FunctionResponse has been processed and lr_tool_caller completed its turn),
-                # then `ctx.session.state[self.lr_tool_caller.output_key]` will hold the URIs.
+
+        thought_text = f"Iterative image generation complete. Generated {len(all_generated_assets_details_for_this_agent)} assets."
+        logger.info(f"[{self.name}] {thought_text}")
+        yield Event(author=self.name, content=types.Content(role="model", parts=[types.Part(text=thought_text)]))
+
+################################################################################
+# --- PHASE 3: VideoPipelineAgent (Corrected State Handling) ---
+################################################################################
+class VideoPipelineAgent(BaseAgent):
+    model_config = {"arbitrary_types_allowed": True}
+    veo_prompt_generator: LlmAgent
+    video_generator_mcp_caller: DirectToolCallerBaseAgent
+
+    def __init__(self, name: str,
+                 veo_prompt_generator: LlmAgent,
+                 video_generator_mcp_caller: DirectToolCallerBaseAgent):
+        super().__init__(
+            name=name,
+            veo_prompt_generator=veo_prompt_generator,
+            video_generator_mcp_caller=video_generator_mcp_caller,
+            sub_agents=[veo_prompt_generator, video_generator_mcp_caller]
+        )
+
+    @override
+    async def _run_async_impl(self, ctx: InvocationContext) -> AsyncGenerator[Event, None]:
+        logger.info(f"[{self.name}] Starting video clip generation pipeline.")
+        # Initialize the final list in session state that AssetValidator might check
+        ctx.session.state["final_video_assets_list"] = []
+        # Local list to build up details for this agent's processing
+        final_video_assets_list_for_this_agent = []
+        generated_video_uris_list = [] # To store URIs parsed from the caller agent
+
+        if not ctx.session.state.get("current_recap"):
+            logger.warning(f"[{self.name}] 'current_recap' missing. Skipping video generation.")
+            # Yield a thought event and return
+            thought_text = "Video pipeline skipped: no recap."
+            yield Event(author=self.name, content=types.Content(role="model", parts=[types.Part(text=thought_text)]))
+            return
+
+        # Step 1: Generate Veo Prompts
+        logger.info(f"[{self.name}] Running VeoPromptGenerator...")
+        async for event in self.veo_prompt_generator.run_async(ctx):
+            yield event # Yield events from veo_prompt_generator
+
+        # VeoPromptGenerator should have set "veo_generation_prompts_json" in the state
+        raw_veo_prompts_json = ctx.session.state.get("veo_generation_prompts_json", "[]")
+        cleaned_veo_prompts_json_for_tool_input = _clean_json_string_from_llm(raw_veo_prompts_json)
+        
+        try:
+            parsed_veo_prompts = json.loads(cleaned_veo_prompts_json_for_tool_input)
+            if not isinstance(parsed_veo_prompts, list) or not parsed_veo_prompts:
+                logger.info(f"[{self.name}] No valid Veo prompts were generated by VeoPromptGenerator. Skipping video tool call.")
+            else:
+                # Ensure the state key for the tool has the cleaned, valid JSON string list of prompts
+                ctx.session.state["veo_generation_prompts_json_for_tool"] = json.dumps(parsed_veo_prompts)
                 
-                # This requires the agent client to manage re-running this agent or the parent.
-                # This is where CustomAgent's `_run_async_impl` shines for complex stateful flows.
+                # Ensure game_pk_str_for_tool is set if not already
+                if "game_pk_str_for_tool" not in ctx.session.state:
+                     ctx.session.state['game_pk_str_for_tool'] = str(ctx.session.state.get("game_pk", "unknown_game"))
+                logger.info(f"[{self.name}] Prepared {len(parsed_veo_prompts)} Veo prompts for VideoGeneratorMCPCaller.")
 
-                # Let's assume for now:
-                # - `lr_tool_caller` is run. It makes the tool call. This agent's `_run_async_impl` yields and effectively ends this "turn".
-                # - The agent client polls, gets image URIs for the `task_id` that `lr_tool_caller` initiated.
-                # - The client injects a `FunctionResponse`.
-                # - The `Runner` processes this, eventually `lr_tool_caller` processes the `FunctionResponse` and writes its `output_key`.
-                # - The *next time* `ADKNativeIterativeImageGenerationAgent` (or its parent) is run, the image URIs are available.
+                # Step 2: Call the Video Generator MCP Caller Agent
+                logger.info(f"[{self.name}] Running VideoGeneratorMCPCaller...")
+                async for event in self.video_generator_mcp_caller.run_async(ctx):
+                    yield event # Yield events from video_generator_mcp_caller
 
-                # This means `ADKNativeIterativeImageGenerationAgent` cannot have its own simple for-loop for refinement
-                # if the image generation step within that loop is an LRFT handled by the client.
-                # It should rather be structured as a state machine or a sequence of agents where the "client action" is a break point.
+                # After video_generator_mcp_caller_agent runs, its output should be in "generated_video_clips_uris_json"
+                tool_output_video_uris_raw = ctx.session.state.get("generated_video_clips_uris_json", '"[]"')
+                tool_output_video_uris_clean = _clean_json_string_from_llm(tool_output_video_uris_raw, default_if_empty='"[]"')
+                logger.info(f"[{self.name}] Raw output from VideoGeneratorMCPCaller (state 'generated_video_clips_uris_json'): '{tool_output_video_uris_clean[:200]}...'")
 
-                # Let's simplify `ADKNativeIterativeImageGenerationAgent` for this refactor to do ONE pass:
-                # GenPrompts -> CallLRFT (and PAUSE).
-                # The critique and new prompts part will be handled by a *separate subsequent agent*
-                # once the LRFT result is available in state.
-
-                # So, this agent becomes simpler:
-                # (In _run_async_impl of a new orchestrator for image generation)
-                # 1. Run self.prompt_generator
-                # 2. Run self.lr_tool_caller
-                # (This agent's job for this "turn" is done. It has initiated the LR task)
-                # The result processing and critique will be handled by other agents in the main sequence
-                # after the client has done its part.
-
-                # For the purpose of returning *something* for the `all_generated_image_assets_details`
-                # it would be populated *after* the LR tool has completed and its results are in state.
-                # This implies that the agent that populates `all_generated_image_assets_details`
-                # runs *after* the LR tool is fully resolved.
-
-                # Let's define what this agent DOES:
-                # It generates prompts, initiates the LR image gen.
-                # The actual processing of results and critique happens later in the main sequence.
-                # So, this agent should probably be split or simplified.
-
-                # Path for this refactor:
-                # 1. `GeneratedVisualPromptsForLR` (LlmAgent) -> outputs `visual_generation_prompts_json`
-                # 2. `ImageGenerationLRToolCallerAgent` (LlmAgent) -> calls LRFT, outputs `image_generation_lr_task_submission_details`
-                #    (The runner loop now polls and injects FunctionResponse for the tool call made by ImageGenerationLRToolCallerAgent)
-                #    (When ImageGenerationLRToolCallerAgent resumes, its output_key gets the actual image URIs as a JSON string)
-                # 3. `ImageResultProcessingAgent` (New BaseAgent or LlmAgent)
-                #    - Input: reads `ImageGenerationLRToolCallerAgent.output_key` (which contains JSON string of URIs)
-                #    - Parses it.
-                #    - Populates `all_generated_image_assets_details` in session state.
-                #    - Populates `assets_for_critique_json` in session state.
-                # 4. `VisualCriticAgent` (LlmAgent) - uses `assets_for_critique_json`
-                # 5. `NewVisualPromptsCreatorAgent` (LlmAgent) - uses `visual_critique_text` (for a potential next iteration if a LoopAgent orchestrates this)
-
-                # `ADKNativeIterativeImageGenerationAgent` can be a `SequentialAgent` of these new components.
-                # The "iterative" part would mean this whole sequence is looped by a parent `LoopAgent`.
-
-                # For now, this agent is a ONE-PASS sequence:
-                current_prompts_list_for_iter = []
                 try:
-                    parsed_list = json.loads(current_prompts_json_for_tool)
-                    if isinstance(parsed_list, list) and parsed_list:
-                        current_prompts_list_for_iter = [str(p) for p in parsed_list if isinstance(p, str) and p]
-                except (json.JSONDecodeError, ValueError) as e:
-                    logger.error(f"[{self.name}] Invalid JSON/content for prompts. Error: {e}. JSON: '{current_prompts_json_for_tool}'.")
-                    yield Event(author=self.name, content=types.Content(role="model", parts=[types.Part(text="Error with image prompts.")]))
-                    return
-                
-                if not current_prompts_list_for_iter:
-                    logger.info(f"[{self.name}] No valid prompts to process for image generation.")
-                    yield Event(author=self.name, content=types.Content(role="model", parts=[types.Part(text="No valid prompts for image generation.")]))
-                    return
+                    parsed_video_tool_output = json.loads(tool_output_video_uris_clean)
+                    if isinstance(parsed_video_tool_output, list):
+                        generated_video_uris_list = [uri for uri in parsed_video_tool_output if isinstance(uri, str) and uri.startswith("gs://")]
+                        logger.info(f"[{self.name}] Successfully parsed {len(generated_video_uris_list)} video URIs from VideoGeneratorMCPCaller's output: {generated_video_uris_list}")
+                    elif isinstance(parsed_video_tool_output, dict) and parsed_video_tool_output.get("error"):
+                        logger.error(f"[{self.name}] VideoGeneratorMCPCaller tool reported an error: {parsed_video_tool_output.get('error')}")
+                    else:
+                        logger.warning(f"[{self.name}] VideoGeneratorMCPCaller output was not a list or error dict: {parsed_video_tool_output}")
+                except json.JSONDecodeError as e:
+                    logger.error(f"[{self.name}] Failed to parse JSON from VideoGeneratorMCPCaller's output. Error: {e}. JSON string was: '{tool_output_video_uris_clean}'")
+        
+        except (json.JSONDecodeError, ValueError) as e:
+            logger.error(f"[{self.name}] Error processing Veo prompts from VeoPromptGenerator: {e}. JSON was: '{cleaned_veo_prompts_json_for_tool_input}'")
+        
+        # Step 3: Populate the final_video_assets_list based on successfully retrieved URIs
+        for idx, uri in enumerate(generated_video_uris_list): # Use the list populated from the caller's output
+            final_video_assets_list_for_this_agent.append({
+                "video_uri": uri,
+                "type": "generated_video",
+                "source_prompt_index": idx # Or some other metadata from parsed_veo_prompts if available
+            })
+        
+        # Update the session state with the list of asset details
+        ctx.session.state["final_video_assets_list"] = final_video_assets_list_for_this_agent
+        
+        count_generated = len(final_video_assets_list_for_this_agent)
+        thought_text = f"Video pipeline complete. Generated {count_generated} videos."
+        logger.info(f"[{self.name}] {thought_text}")
+        if final_video_assets_list_for_this_agent: # Log details if any videos were made
+            logger.info(f"[{self.name}] Details of generated video assets: {json.dumps(final_video_assets_list_for_this_agent, indent=2)}")
 
-                # This agent's main job is to kick off the LRFT call via its sub_agent
-                # It doesn't directly process the final image URIs in this same run.
-                # That happens after the client polling.
-                # The `all_generated_image_assets_details` will be populated by a *subsequent* agent in the sequence.
-                thought = f"[{self.name}] {iteration_label}: Image generation initiated via LRToolCaller. Client will poll."
-                logger.info(thought)
-                yield Event(author=self.name, content=types.Content(role="model", parts=[types.Part(text=thought)]))
-
-                # The actual image URI processing and adding to `all_generated_assets_details_for_this_agent`
-                # will happen in a *later* agent in the sequence, AFTER the LR Tool is resolved by the client.
-                # So, this agent doesn't directly populate `all_generated_image_assets_details`.
-                # A different agent will read `ImageGenerationLRToolCallerAgent.output_key` later.
-                
-                # If this agent is supposed to handle the full loop (including waiting for LRFT), it MUST be a CustomAgent
-                # with its own internal polling logic that interacts with the external client's polling. This is too complex for now.
-
-                # Let's assume this simplified agent just runs the first two steps for ONE set of prompts.
-                # The critique/refinement part will be handled by `AssetValidationAndRetryAgent` or a similar orchestrator
-                # that runs AFTER the LR tools are resolved.
-
-            # This simplified agent does not loop internally for LRFTs.
-            # It initiates one batch of image generation.
-            # The `all_generated_image_assets_details` will be populated by another agent.
-            logger.info(f"[{self.name}] Image generation initiation phase complete.")
-            # No further processing of URIs or critique within THIS agent for now.
-            # That logic needs to be shifted to an agent that runs AFTER client polling.
-
+        yield Event(
+            author=self.name,
+            content=types.Content(role="model", parts=[types.Part(text=thought_text)])
+        )
 
 
 
@@ -1067,6 +1031,132 @@ class SpeechToTimestampsAgent(BaseAgent):
         logger.info(f"[{self.name}] {thought_text}")
         yield Event(author=self.name, content=types.Content(role="model", parts=[types.Part(text=thought_text)]))
 
+
+################################################################################
+# --- AssetValidationAndRetryAgent (Copied - Assumed Correct) ---
+# This agent reads from state, so its internal logic doesn't need to change
+# as long as the state keys it expects are populated by the parallel pipelines.
+################################################################################
+class AssetValidationAndRetryAgent(BaseAgent):
+    model_config = {"arbitrary_types_allowed": True}
+    static_asset_pipeline_agent: StaticAssetPipelineAgent
+    iterative_image_generation_agent: IterativeImageGenerationAgent
+    video_pipeline_agent: VideoPipelineAgent
+    text_to_speech_agent: TextToSpeechAgent
+    speech_to_timestamps_agent: SpeechToTimestampsAgent
+    max_retries_per_pipeline: int
+
+    def __init__(self, name: str,
+                 static_asset_pipeline_agent: StaticAssetPipelineAgent,
+                 iterative_image_generation_agent: IterativeImageGenerationAgent,
+                 video_pipeline_agent: VideoPipelineAgent,
+                 text_to_speech_agent: TextToSpeechAgent,
+                 speech_to_timestamps_agent: SpeechToTimestampsAgent,
+                 max_retries_per_pipeline: int = 1):
+        super().__init__(
+            name=name,
+            # These are passed for potential re-invocation, not for ADK sub_agent hierarchy here.
+            # The sub_agents list for BaseAgent could be empty if this agent only calls run_async on others.
+            # For clarity, listing them as attributes that Pydantic will handle.
+            static_asset_pipeline_agent=static_asset_pipeline_agent,
+            iterative_image_generation_agent=iterative_image_generation_agent,
+            video_pipeline_agent=video_pipeline_agent,
+            text_to_speech_agent=text_to_speech_agent,
+            speech_to_timestamps_agent=speech_to_timestamps_agent,
+            max_retries_per_pipeline=max_retries_per_pipeline,
+            sub_agents=[] # This agent orchestrates others but doesn't have them as direct sub-components in ADK's structural sense for this example
+        )
+        # Pydantic assigns these to self
+        self.static_asset_pipeline_agent = static_asset_pipeline_agent
+        self.iterative_image_generation_agent = iterative_image_generation_agent
+        self.video_pipeline_agent = video_pipeline_agent
+        self.text_to_speech_agent = text_to_speech_agent
+        self.speech_to_timestamps_agent = speech_to_timestamps_agent
+
+    @override
+    async def _run_async_impl(self, ctx: InvocationContext) -> AsyncGenerator[Event, None]:
+        logger.info(f"[{self.name}] Starting asset validation and retry process.")
+        if "asset_retry_counts" not in ctx.session.state:
+            ctx.session.state["asset_retry_counts"] = {"static": 0, "image_gen": 0, "video_gen": 0, "tts": 0, "stt": 0}
+        retry_counts = ctx.session.state["asset_retry_counts"]
+
+        if not ctx.session.state.get("current_recap"):
+            logger.warning(f"[{self.name}] No current_recap. Skipping validation.")
+            yield Event(author=self.name, type="agent_thought", content=types.Content(role="model", parts=[types.Part(text="Asset validation skipped: no recap.")]))
+            return
+
+        # Static Assets
+        static_assets = ctx.session.state.get("current_static_assets_list", [])
+        if (not static_assets or not any(sa.get("image_uri") for sa in static_assets)) and retry_counts["static"] < self.max_retries_per_pipeline:
+            logger.warning(f"[{self.name}] Static assets missing/incomplete. Retrying (attempt {retry_counts['static'] + 1}).")
+            retry_counts["static"] += 1
+            ctx.session.state["current_static_assets_list"] = []
+            async for event in self.static_asset_pipeline_agent.run_async(ctx): yield event
+        elif not static_assets or not any(sa.get("image_uri") for sa in static_assets):
+             logger.warning(f"[{self.name}] Static assets still missing/incomplete after max retries.")
+
+
+        # Generated Images
+        generated_images = ctx.session.state.get("all_generated_image_assets_details", [])
+        if (not generated_images or not any(gi.get("image_uri") for gi in generated_images)) and retry_counts["image_gen"] < self.max_retries_per_pipeline:
+            logger.warning(f"[{self.name}] Generated images missing/incomplete. Retrying (attempt {retry_counts['image_gen'] + 1}).")
+            retry_counts["image_gen"] += 1
+            ctx.session.state["all_generated_image_assets_details"] = []
+            async for event in self.iterative_image_generation_agent.run_async(ctx): yield event
+        elif not generated_images or not any(gi.get("image_uri") for gi in generated_images):
+            logger.warning(f"[{self.name}] Generated images still missing/incomplete after max retries.")
+
+        # Generated Videos
+        generated_videos = ctx.session.state.get("final_video_assets_list", [])
+        if (not generated_videos or not any(gv.get("video_uri") for gv in generated_videos)) and retry_counts["video_gen"] < self.max_retries_per_pipeline:
+            logger.warning(f"[{self.name}] Generated videos missing/incomplete. Retrying (attempt {retry_counts['video_gen'] + 1}).")
+            retry_counts["video_gen"] += 1
+            ctx.session.state["final_video_assets_list"] = []
+            async for event in self.video_pipeline_agent.run_async(ctx): yield event
+        elif not generated_videos or not any(gv.get("video_uri") for gv in generated_videos):
+            logger.warning(f"[{self.name}] Generated videos still missing/incomplete after max retries.")
+
+        # Text-to-Speech (TTS)
+        generated_audio_uri = ctx.session.state.get("generated_dialogue_audio_uri")
+        if not generated_audio_uri and retry_counts["tts"] < self.max_retries_per_pipeline:
+            logger.warning(f"[{self.name}] Generated audio URI (TTS) missing. Retrying (attempt {retry_counts['tts'] + 1}).")
+            retry_counts["tts"] += 1
+            ctx.session.state["generated_dialogue_audio_uri"] = None
+            async for event in self.text_to_speech_agent.run_async(ctx): yield event
+            generated_audio_uri = ctx.session.state.get("generated_dialogue_audio_uri") # Re-check
+        elif not generated_audio_uri :
+            logger.warning(f"[{self.name}] Generated audio URI (TTS) still missing after max retries.")
+
+
+        # Speech-to-Timestamps (STT) - only if TTS was successful
+        if generated_audio_uri:
+            word_timestamps = ctx.session.state.get("word_timestamps_list", [])
+            if not word_timestamps and retry_counts["stt"] < self.max_retries_per_pipeline:
+                logger.warning(f"[{self.name}] Word timestamps (STT) missing. Retrying (attempt {retry_counts['stt'] + 1}).")
+                retry_counts["stt"] += 1
+                ctx.session.state["word_timestamps_list"] = []
+                async for event in self.speech_to_timestamps_agent.run_async(ctx): yield event
+            elif not word_timestamps:
+                logger.warning(f"[{self.name}] Word timestamps (STT) still missing after max retries.")
+        else:
+            logger.info(f"[{self.name}] Skipping STT validation as TTS URI is missing.")
+
+
+        ctx.session.state["asset_retry_counts"] = retry_counts
+        # Final aggregation for images (remains important for final output state)
+        current_static_assets = ctx.session.state.get("current_static_assets_list", [])
+        all_generated_image_details = ctx.session.state.get("all_generated_image_assets_details", [])
+        final_generated_visuals_dict = {}
+        for asset in sorted(all_generated_image_details, key=lambda x: x.get("iteration", 0)): # Sort to get latest iteration if duplicates by URI (unlikely here)
+            if asset.get("image_uri"):
+                final_generated_visuals_dict[asset["image_uri"]] = asset # Overwrite with later iterations if URI is same
+        ctx.session.state["all_image_assets_list"] = current_static_assets + list(final_generated_visuals_dict.values())
+
+
+        logger.info(f"[{self.name}] Asset validation and retry process finished.")
+        thought_text = "Asset validation and retry efforts complete."
+        logger.info(f"[{self.name}] {thought_text}")
+        yield Event(author=self.name, content=types.Content(role="model", parts=[types.Part(text=thought_text)]))
 
 ################################################################################
 # --- NEW GameRecapAgentV2 (Parallelized) ---
@@ -1404,130 +1494,6 @@ Output ONLY the revised dialogue script. No intros/outros.
         instruction="Tone analyzer. Session: `current_recap`. Analyze from winner/neutral perspective. Output ONLY: 'positive', 'negative', or 'neutral'.",
         output_key="tone_check_result",
     )
-    generated_visual_prompts_agent = LlmAgent( # Was: GeneratedVisualPrompts
-        name="GeneratedVisualPromptsForLR", # New name for clarity
-        model=GEMINI_FLASH_MODEL_ID,
-        instruction="""
-Assistant director analyzing 'current_recap' for Imagen 3 shots (filters names).
-Identify 3-5 key moments/scenes.
-**Imagen Rules:** NO Player/Team Names. Generic uniforms ("player in white home uniform", "batter in colored away jersey", "MLB player's uniform").
-**Prompts:** Actions (HR, DP, K) -> 1-2 prompts. Descriptive moments (stadium) -> 1 prompt. Emphasize action, emotion, setting, generic uniforms.
-Output ONLY JSON list of 3-5 prompt strings (e.g., "[\\"Prompt 1\\", ...]"). "[]" if no moments.
-        """,
-        output_key="visual_generation_prompts_json", # This key holds the prompts List[str] for the LR tool
-    )
-
-    # 2. Agent to call the LongRunningFunctionTool for Image Generation
-    image_generation_lr_tool_caller_agent = LlmAgent(
-        name="ImageGenerationLRToolCaller",
-        model=GEMINI_FLASH_MODEL_ID, # Simple model to just make a tool call
-        instruction="""
-You are a dispatcher. Your task is to initiate an image generation job.
-Read the list of image prompts from session state key 'visual_generation_prompts_json'.
-Read the game PK from session state key 'game_pk'.
-You MUST call the 'initiate_image_generation' tool with these prompts and the game_pk_str.
-Your entire job is to make this single tool call. Do not respond with text.
-The tool will return a task ID and status. This will be your output.
-        """,
-        tools=[long_running_image_tool], # Pass the ADK LongRunningFunctionTool
-        output_key="image_generation_lr_task_submission_details" # Will contain {"status": "pending_agent_client_action", "task_id": ...}
-    )
-
-    # Create the sequential agent for one pass of image generation initiation and result collection
-    image_result_processor_agent = LlmAgent( # Can be an LlmAgent if it just needs to parse and set state
-        name="ImageResultProcessorFromLR",
-        model=GEMINI_FLASH_MODEL_ID, # Or even a BaseAgent if no LLM needed
-        instruction="""
-You are a data processor. You will receive a JSON string in session state key '{lr_image_tool_final_output}'.
-This string contains a list of image URIs or an error from an image generation tool.
-Parse this JSON string.
-If it's a list of URIs, create a new list of asset detail objects: `[{"image_uri": "uri1", "type": "generated_image_lr", "prompt_origin":"unknown_for_now"}, ...]`
-Store this list of asset detail objects in session state key 'all_generated_image_assets_details'.
-Also, prepare a JSON string for 'assets_for_critique_json' using these URIs and dummy prompts (e.g., `[{"prompt_origin": "Prompt for URI1", "image_uri": "uri1"}, ...]`).
-If the input JSON string indicates an error, or is not a list, set 'all_generated_image_assets_details' to `[]` and 'assets_for_critique_json' to `"[]"`.
-Output a brief status message like "Processed N image URIs." or "Image generation failed."
-        """,
-        # This agent needs to know the output_key of `image_generation_lr_tool_caller_agent`
-        # Let's assume `image_generation_lr_tool_caller_agent.output_key` is "lr_image_tool_final_output"
-        # This is injected via placeholder in instruction.
-        # This LlmAgent approach is a bit forced for simple data manipulation. A BaseAgent would be cleaner.
-        output_key="image_result_processing_status"
-    )
-
-
-    iterative_image_generation_pipeline_components = [
-        generated_visual_prompts_agent, # Generates prompts into `visual_generation_prompts_json`
-        image_generation_lr_tool_caller_agent, # Calls LRFT, result (after client poll) in `image_generation_lr_task_submission_details` (actually its output_key)
-        # At this point, the main runner loop polls and injects FunctionResponse.
-        # The `image_generation_lr_tool_caller_agent` then completes and writes to its output_key.
-        # We need to use THAT output_key as input for the next agent.
-        # Let's say image_generation_lr_tool_caller_agent.output_key = "final_image_uris_from_lr_tool_json_string"
-    ]
-    # The critique part will be added after this sequence, consuming `all_generated_image_assets_details`
-    # which `image_result_processor_agent` would set.
-
-    # For now, `iterative_image_generation_agent_instance` is simplified to just initiate.
-    # The full iterative loop with LR tools requires more advanced orchestration.
-    # Let's define the agent that *will* be used in the ParallelAssetPipelinesAgent
-    # This will be a sequence that does: GenPrompts -> CallLRFT
-    # The result processing and critique must happen *after* the ParallelAgent completes its branches.
-    image_generation_initiation_sequence = SequentialAgent(
-        name="ImageGenerationInitiationSequence",
-        sub_agents=[
-            generated_visual_prompts_agent,
-            image_generation_lr_tool_caller_agent
-        ],
-        description="Generates prompts and initiates long-running image generation."
-    )
-    # The output of `image_generation_lr_tool_caller_agent` (task details / final URIs after polling)
-    # will be used by later agents in the main GameRecapAgentV2 sequence.  IterativeImageGeneration
-
-    # == VIDEO GENERATION REVISED ==
-    # 1. Agent to generate prompts (same as before)
-    veo_prompt_generator_agent = LlmAgent( # Was: VeoPromptGenerator
-        name="VeoPromptGeneratorForLR", # New name
-        model=GEMINI_PRO_MODEL_ID,
-        instruction="""
-Creative video director for MLB Veo clips (5-8s). Prompts MUST be safe.
-Session: 'current_recap', 'visual_critique_text' (Optional from image phase), 'all_image_assets_list' (Optional), 'all_video_assets_list' (Optional).
-1.  **Review 'current_recap'**: ID 2-3 key moments for short clips (pitch/swing, dive, slide, reaction, fan celebration). Avoid complex sequences.
-2.  **Consider Existing Visuals**: Review 'all_image_assets_list', 'all_video_assets_list'. Avoid duplication unless video adds unique dynamism. Complement, don't repeat.
-3.  **Veo Prompts (1-2, max 3 if distinct & safe):**
-    *   **Safety First:** Adhere to content guidelines. Factual descriptions. AVOID aggressive/violent words (e.g., "batter hits long fly ball" not "crushes"). Focus athleticism.
-    *   **Clarity:** One primary subject/action.
-    *   **Conciseness:** Scene for 5-8s.
-    *   **Dynamic but Safe Language:** Motion, camera work ("slow-motion of...", "dynamic low-angle...").
-    *   **Naming Rules (Strict):** NO player/team names. Generic: "MLB player", "home team batter".
-Output ONLY JSON list of 1-2 (max 3) Veo prompt strings. `"[]"` if no suitable moments. Example: `["Slow-motion of baseball hitting bat.", "Dynamic shot of player sliding."]`
-        """,
-        output_key="veo_generation_prompts_json", # This key holds the prompts List[str] for the LR tool
-    )
-
-    # 2. Agent to call the LongRunningFunctionTool for Video Generation
-    video_generation_lr_tool_caller_agent = LlmAgent(
-        name="VideoGenerationLRToolCaller",
-        model=GEMINI_FLASH_MODEL_ID,
-        instruction="""
-You are a dispatcher. Your task is to initiate a video generation job.
-Read the list of video prompts from session state key 'veo_generation_prompts_json'.
-Read the game PK from session state key 'game_pk'.
-You MUST call the 'initiate_video_generation' tool with these prompts and the game_pk_str.
-Your entire job is to make this single tool call. Do not respond with text.
-The tool will return a task ID and status. This will be your output.
-        """,
-        tools=[long_running_video_tool],
-        output_key="video_generation_lr_task_submission_details"
-    )
-
-    video_generation_initiation_sequence = SequentialAgent(
-        name="VideoGenerationInitiationSequence",
-        sub_agents=[
-            veo_prompt_generator_agent,
-            video_generation_lr_tool_caller_agent
-        ],
-        description="Generates prompts and initiates long-running video generation."
-    )
-
 
     # Asset-related LlmAgents (copied)
     entity_extractor_agent = LlmAgent(
@@ -1578,8 +1544,17 @@ You are a robot with a single, precise function.
         tools=loaded_mcp_tools_global.get("static_retriever_mcp", []),
         output_key="headshot_uri_result_json",
     )
-
-
+    generated_visual_prompts_agent = LlmAgent(
+        name="GeneratedVisualPrompts", model=GEMINI_FLASH_MODEL_ID, # Changed from PRO
+        instruction="""
+Assistant director analyzing 'current_recap' for Imagen 3 shots (filters names).
+Identify 3-5 key moments/scenes.
+**Imagen Rules:** NO Player/Team Names. Generic uniforms ("player in white home uniform", "batter in colored away jersey", "MLB player's uniform").
+**Prompts:** Actions (HR, DP, K) -> 1-2 prompts. Descriptive moments (stadium) -> 1 prompt. Emphasize action, emotion, setting, generic uniforms.
+Output ONLY JSON list of 3-5 prompt strings (e.g., "[\\"Prompt 1\\", ...]"). "[]" if no moments.
+        """,
+        output_key="visual_generation_prompts_json",
+    )
     visual_generator_mcp_caller_agent = LlmAgent(
         name="VisualGeneratorMCPCaller", model=GEMINI_FLASH_MODEL_ID, # Changed from PRO
         instruction="""
@@ -1616,7 +1591,23 @@ Output ONLY JSON list string. Example: "[\\"Dynamic shot of fielders turning dou
         """,
         output_key="new_visual_generation_prompts_json",
     )
-
+    veo_prompt_generator_agent = LlmAgent(
+        name="VeoPromptGenerator", model=GEMINI_PRO_MODEL_ID,
+        instruction="""
+Creative video director for MLB Veo clips (5-8s). Prompts MUST be safe.
+Session: 'current_recap', 'visual_critique_text' (Optional from image phase), 'all_image_assets_list' (Optional), 'all_video_assets_list' (Optional).
+1.  **Review 'current_recap'**: ID 2-3 key moments for short clips (pitch/swing, dive, slide, reaction, fan celebration). Avoid complex sequences.
+2.  **Consider Existing Visuals**: Review 'all_image_assets_list', 'all_video_assets_list'. Avoid duplication unless video adds unique dynamism. Complement, don't repeat.
+3.  **Veo Prompts (1-2, max 3 if distinct & safe):**
+    *   **Safety First:** Adhere to content guidelines. Factual descriptions. AVOID aggressive/violent words (e.g., "batter hits long fly ball" not "crushes"). Focus athleticism.
+    *   **Clarity:** One primary subject/action.
+    *   **Conciseness:** Scene for 5-8s.
+    *   **Dynamic but Safe Language:** Motion, camera work ("slow-motion of...", "dynamic low-angle...").
+    *   **Naming Rules (Strict):** NO player/team names. Generic: "MLB player", "home team batter".
+Output ONLY JSON list of 1-2 (max 3) Veo prompt strings. `"[]"` if no suitable moments. Example: `["Slow-motion of baseball hitting bat.", "Dynamic shot of player sliding."]`
+        """,
+        output_key="veo_generation_prompts_json",
+    )
     video_generator_mcp_caller_agent = LlmAgent(
         name="VideoGeneratorMCPCaller", model=GEMINI_PRO_MODEL_ID,
         instruction="""
@@ -1801,7 +1792,17 @@ Output ONLY the JSON string list.
         default_output_on_error='"[]"' # Expects JSON string of a list
     )
 
-# GeneratedVisualPromptsForLR
+
+
+    # Update IterativeImageGenerationAgent to use this new agent:
+    iterative_image_generation_agent_instance = IterativeImageGenerationAgent(
+        name="IterativeImageGeneration",
+        generated_visual_prompts_generator=generated_visual_prompts_agent,
+        visual_generator_mcp_caller=direct_visual_generator_agent, # <--- USE NEW AGENT
+        visual_critic=visual_critic_agent,
+        new_visual_prompts_creator=new_visual_prompts_from_critique_agent,
+        max_visual_refinement_loops=1
+    )
 
     # 2. For Video Generation (replaces VideoGeneratorMCPCaller LlmAgent)
     direct_video_generator_agent = DirectToolCallerBaseAgent(
@@ -1846,33 +1847,20 @@ Output ONLY the JSON string list.
         description="Selects appropriate metrics and generates graph images for the game."
     )
 
-    # StaticAssetPipelineAgent, TextToSpeechAgent, SpeechToTimestampsAgent, GraphGenerationPipeline remain the same
-    # as they don't use DirectToolCallerBaseAgent internally for their primary function or are already LlmAgents/custom.
-    # The `logo_searcher_llm` and `headshot_retriever_llm` inside `StaticAssetPipelineAgent`
-    # were LlmAgents, not DirectToolCallerBaseAgent.
-    # Checking: `logo_searcher_llm_agent` and `headshot_retriever_llm_agent` were indeed LlmAgents in your original code.
-    # If they were `DirectToolCallerBaseAgent`, they'd need similar refactoring, but they were not.
-
-    # The agents `direct_logo_searcher_agent`, `direct_headshot_retriever_agent`,
-    # `direct_visual_generator_agent`, `direct_video_generator_agent`, `direct_tts_agent`, `direct_stt_agent`
-    # were all instances of `DirectToolCallerBaseAgent` and are being replaced or their callers are.
-    # `visual_generator_mcp_caller` was used by `IterativeImageGenerationAgent` -> replaced by `image_generation_lr_tool_caller_agent`.
-    # `video_generator_mcp_caller` was used by `VideoPipelineAgent` -> replaced by `video_generation_lr_tool_caller_agent`.
-
-    # Update `StaticAssetPipelineAgent` to ensure its sub-agents are LlmAgents as previously defined,
-    # not the `DirectToolCallerBaseAgent` versions that were placeholders for MCP replacement.
-    # The `logo_searcher_llm_agent` and `headshot_retriever_llm_agent` should be the LlmAgent versions provided earlier.
-
     # --- Instantiate Custom Phase Agents (BaseAgent subclasses) ---
     static_asset_pipeline_agent_instance = StaticAssetPipelineAgent(
         name="StaticAssetPipeline",
-        entity_extractor=entity_extractor_agent, # This is an LlmAgent
-        static_asset_query_generator=static_asset_query_generator_agent, # This is an LlmAgent
-        logo_searcher_llm=direct_logo_searcher_agent, # This MUST be the LlmAgent version
-        headshot_retriever_llm=direct_headshot_retriever_agent # This MUST be the LlmAgent version
+        entity_extractor=entity_extractor_agent,
+        static_asset_query_generator=static_asset_query_generator_agent,
+        logo_searcher_llm=direct_logo_searcher_agent, 
+        headshot_retriever_llm=direct_headshot_retriever_agent 
     )
 
-
+    video_pipeline_agent_instance = VideoPipelineAgent(
+        name="VideoPipeline",
+        veo_prompt_generator=veo_prompt_generator_agent,
+        video_generator_mcp_caller=direct_video_generator_agent
+    )
     text_to_speech_agent_instance = TextToSpeechAgent( # This is your BaseAgent wrapper
         name="TextToSpeechPipeline",
         dialogue_to_speech_llm_agent=direct_tts_agent 
@@ -1920,106 +1908,29 @@ Output ONLY the JSON string list.
         description="Generates dialogue audio and then corresponding word timestamps."
     )
 
-    # --- Update ParallelAssetPipelinesAgent ---
+    # 3. Parallel Asset Generation Pipelines
     parallel_asset_pipelines_instance = ParallelAgent(
         name="ParallelAssetGenerationPipelines",
         sub_agents=[
-            static_asset_pipeline_agent_instance,         # Unchanged in its LR nature (uses LlmAgents for tools)
-            image_generation_initiation_sequence,         # NEW: Initiates LR image gen
-            video_generation_initiation_sequence,         # NEW: Initiates LR video gen
-            # audio_processing_pipeline_for_parallel_instance, # This was sequential TTS then STT
-          #  text_to_speech_adk_native_agent, # NEW: Initiates LR TTS
-            # STT depends on TTS result, so it cannot be in this parallel set directly if TTS is LR.
-            # STT initiation will happen *after* TTS LR is resolved.
-            graph_generation_pipeline_agent_instance      # Unchanged
+            static_asset_pipeline_agent_instance,         # Reads 'current_recap', Output: 'current_static_assets_list'
+            iterative_image_generation_agent_instance,    # Reads 'current_recap', Output: 'all_generated_image_assets_details'
+            video_pipeline_agent_instance,                # Reads 'current_recap', Output: 'final_video_assets_list'
+            audio_processing_pipeline_for_parallel_instance, # The sequential audio pipeline defined above
+            graph_generation_pipeline_agent_instance 
         ],
-        description="Concurrently initiates generation of static assets, images, videos, audio (TTS), and graphs."
+        description="Concurrently generates all static, image, video, and audio assets based on the final script."
     )
 
-    # The GameRecapAgentV2 sequence needs to be adjusted:
-    # 1. Script Generation
-    # 2. Parallel Asset Initiation (the ParallelAgent above)
-    # --- AT THIS POINT, THE AGENT CLIENT POLLING LOGIC IN main.py RUNS for all initiated LR tasks ---
-    # 3. Result Processing and further dependent tasks:
-    #    - Process Image LR results, then Critique & New Prompts (if desired in a loop)
-    #    - Process Video LR results
-    #    - Process TTS LR results, then Initiate STT LR task
-    #    - (Client polls for STT LR task)
-    #    - Process STT LR results
-    # 4. AssetValidationAndRetryAgent (needs to be aware of the new state keys from LR tools)
-    # 5. AssetAggregatorAgent
-
-    # This makes GameRecapAgentV2 a more complex CustomAgent to manage these states and re-entrancy.
-    # For this refactor, I will focus on getting the LR tools initiated and the client polling logic.
-    # The subsequent processing will assume results are populated in state by the client handling.
-
-    # Simplified sequence for GameRecapAgentV2 for this refactor:
-    # Define placeholder "ResultProcessing" agents that would run after client polling.
-    # These would read from state keys like "final_image_uris_from_lr_tool_json_string"
-    # (which is the output_key of the LlmAgent that called the LRFT, after client injected FunctionResponse).
-
-    image_final_result_processor = LlmAgent(
-        name="ImageFinalResultProcessor", model=GEMINI_FLASH_MODEL_ID,
-        instruction="""You are a data processor.
-Read image URIs from session state '{image_generation_lr_tool_caller_agent_output_key}'.
-Format them into 'all_generated_image_assets_details' and 'assets_for_critique_json'.
-Output: 'Image results processed.'""",
-        # Placeholder for actual state key name.
-        output_key="image_final_result_processing_status"
+    # 4. Asset Validation and Retry Agent (remains the same custom BaseAgent)
+    asset_validator_instance = AssetValidationAndRetryAgent(
+        name="AssetValidationAndRetry",
+        static_asset_pipeline_agent=static_asset_pipeline_agent_instance, # Pass the instance
+        iterative_image_generation_agent=iterative_image_generation_agent_instance, # Pass the instance
+        video_pipeline_agent=video_pipeline_agent_instance, # Pass the instance
+        text_to_speech_agent=text_to_speech_agent_instance, # Pass the instance
+        speech_to_timestamps_agent=speech_to_timestamps_agent_instance, # Pass the instance
+        max_retries_per_pipeline=1 # Or your desired value
     )
-    video_final_result_processor = LlmAgent(
-        name="VideoFinalResultProcessor", model=GEMINI_FLASH_MODEL_ID,
-        instruction="""You are a data processor.
-Read video URIs from session state '{video_generation_lr_tool_caller_agent_output_key}'.
-Format them into 'final_video_assets_list'.
-Output: 'Video results processed.'""",
-        output_key="video_final_result_processing_status"
-    )
-    tts_final_result_processor = LlmAgent(
-        name="TTSFinalResultProcessor", model=GEMINI_FLASH_MODEL_ID,
-        instruction="""You are a data processor.
-Read TTS audio URI from session state '{tts_lr_tool_caller_agent_output_key}'.
-Store it in 'generated_dialogue_audio_uri'.
-Output: 'TTS result processed.'""",
-        output_key="tts_final_result_processing_status"
-    )
-    # This agent would then trigger the STT LR tool call.
-  #  stt_initiation_after_tts_agent = speech_to_timestamps_adk_native_agent # Re-use the STT initiation sequence
-
-    stt_final_result_processor = LlmAgent(
-        name="STTFinalResultProcessor", model=GEMINI_FLASH_MODEL_ID,
-        instruction="""You are a data processor.
-Read STT timestamps from session state '{stt_lr_tool_caller_agent_output_key}'.
-Store it in 'word_timestamps_list'.
-Output: 'STT result processed.'""",
-        output_key="stt_final_result_processing_status"
-    )
-    asset_aggregator_agent_instance = AssetAggregatorAgent(name="AssetAggregator") # Defined above
-    # New GameRecapAgentV2 structure
-    game_recap_assistant_v2 = SequentialAgent(
-        name="game_recap_assistant_v2",
-        sub_agents=[
-            script_generation_pipeline_instance,       # Generates script, game_pk, prompts for assets
-            parallel_asset_pipelines_instance,         # Initiates LR tasks for image, video, TTS, graph
-            # --- Client Polling Happens Here for Image, Video, TTS, Graph LR tasks ---
-            image_final_result_processor,              # Processes results of image LR task
-            video_final_result_processor,              # Processes results of video LR task
-           # tts_final_result_processor,                # Processes results of TTS LR task
-         #   stt_initiation_after_tts_agent,            # Initiates STT LR task (uses TTS result)
-            # --- Client Polling Happens Here for STT LR task ---
-           # stt_final_result_processor,                # Processes results of STT LR task
-            # The critique and refinement for images would go here, potentially in a LoopAgent
-            # For now, simplified:
-            visual_critic_agent,                       # Critiques images based on results from image_final_result_processor
-            new_visual_prompts_from_critique_agent,    # Creates new prompts (not used in a loop in this simplified version)
-           # asset_validator_instance,                  # Validates all collected assets
-            asset_aggregator_agent_instance            # Aggregates for final output
-        ],
-        description="Orchestrates game recap and ADK-native long-running asset creation with client-side polling."
-    )
-
-
-
 
     # 5. The New GameRecapAgentV2 (Sequential Orchestrator)
     #    This is the agent that will be routed to by the root_agent.
@@ -2027,8 +1938,18 @@ Output: 'STT result processed.'""",
     #    We must provide a final output if this agent is called directly by the root agent (final response).
     #    To do this, we can add a final LlmAgent that just takes 'current_recap' and outputs it.
 
+    asset_aggregator_agent_instance = AssetAggregatorAgent(name="AssetAggregator") # Defined above
 
-
+    game_recap_assistant_v2 = SequentialAgent(
+        name="game_recap_assistant_v2",
+        sub_agents=[
+            script_generation_pipeline_instance,
+            parallel_asset_pipelines_instance,
+            #asset_validator_instance,
+            asset_aggregator_agent_instance # NEW: Use this as the final step
+        ],
+        description="Orchestrates game recap, asset creation/validation, and final asset aggregation."
+    )
 
 
     # Inside game_recap_assistant_v2, a dummy _run_async_impl is needed if it inherits BaseAgent directly.
@@ -2050,265 +1971,40 @@ Output: 'STT result processed.'""",
     )
     return root_agent
 
-
-
-# --- Agent Execution Helpers - MODIFIED for LRFT Polling ---
-# Store pending long-running tasks that the client needs to poll
-# Key: session_id, Value: List of task_ids_details e.g. [{"task_id": "...", "tool_name": "...", "original_tool_call_id": "..."}]
-PENDING_LR_TASKS_FOR_CLIENT_POLLING: Dict[str, List[Dict[str,Any]]] = {}
-
-async def _handle_long_running_tool_event(event: Event, session_id: str, user_id: str, runner: Runner):
-    if event.long_running_tool_ids and event.content and event.content.parts:
-        for part in event.content.parts:
-            if part.function_call and part.function_call.id in event.long_running_tool_ids:
-                # This is the initial FunctionCall to our LongRunningFunctionTool
-                fc_response_content = part.function_call.response.content if part.function_call.response else None # type: ignore
-                if fc_response_content:
-                    try:
-                        # The initial response from our LRFT initiator (e.g., initiate_image_generation)
-                        # should contain {"status": "pending_agent_client_action", "task_id": ..., "tool_name": ...}
-                        initial_tool_output = json.loads(fc_response_content)
-                        task_id = initial_tool_output.get("task_id")
-                        tool_name = initial_tool_output.get("tool_name")
-                        original_tool_call_id = part.function_call.id # ID of the call to the LRFT
-
-                        if initial_tool_output.get("status") == "pending_agent_client_action" and task_id and tool_name:
-                            logger.info(f"LR_CLIENT: Detected pending LR task {task_id} for tool {tool_name} (call_id: {original_tool_call_id}). Will poll.")
-                            if session_id not in PENDING_LR_TASKS_FOR_CLIENT_POLLING:
-                                PENDING_LR_TASKS_FOR_CLIENT_POLLING[session_id] = []
-                            PENDING_LR_TASKS_FOR_CLIENT_POLLING[session_id].append({
-                                "task_id": task_id,
-                                "tool_name": tool_name,
-                                "original_tool_call_id": original_tool_call_id,
-                                "user_id": user_id # Store user_id for subsequent run_async
-                            })
-                            # Do not yield this event's text to user yet, as the task is not complete.
-                            return True # Indicates an LR task was detected and is being handled
-                    except json.JSONDecodeError:
-                        logger.error(f"LR_CLIENT: Could not parse initial response from LRFT: {fc_response_content}")
-                    except Exception as e:
-                        logger.error(f"LR_CLIENT: Error processing LRFT initial response: {e}")
-    return False
-
-
-async def _poll_and_inject_responses(session_id: str, runner: Runner):
-    if session_id in PENDING_LR_TASKS_FOR_CLIENT_POLLING and PENDING_LR_TASKS_FOR_CLIENT_POLLING[session_id]:
-        completed_indices = []
-        for idx, task_details in enumerate(PENDING_LR_TASKS_FOR_CLIENT_POLLING[session_id]):
-            task_id = task_details["task_id"]
-            tool_name = task_details["tool_name"]
-            original_tool_call_id = task_details["original_tool_call_id"]
-            user_id_for_task = task_details["user_id"] # Retrieve stored user_id
-
-            task_status_obj = None
-            final_result_payload = None
-
-            if tool_name == "long_running_image_generation_tool":
-                task_status_obj = IMAGE_GENERATION_TASKS.get(task_id)
-            elif tool_name == "long_running_video_generation_tool":
-                task_status_obj = VIDEO_GENERATION_TASKS.get(task_id)
-            # Add other LR tools here (TTS, STT)
-
-            if task_status_obj and task_status_obj.get("status") in ["completed", "failed"]:
-                logger.info(f"LR_CLIENT: Task {task_id} ({tool_name}) completed with status: {task_status_obj['status']}.")
-                if task_status_obj["status"] == "completed":
-                    final_result_payload = task_status_obj.get("result", "{}") # Should be JSON string
-                else: # failed
-                    final_result_payload = json.dumps({"error": task_status_obj.get("error", "Unknown error")})
-
-                # Create FunctionResponse
-                # The 'response' field within FunctionResponse should be a Dict for the ADK.
-                # Our LRFTs are designed to output a JSON string as their "result".
-                # The LLM that called the LRFT expects the tool's output (the FunctionResponse.response.result content)
-                # to be that JSON string.
-                # So, FunctionResponse.response should be {"result": "the_json_string_from_our_task"}
-                # However, the ADK docs state: "The preferred return type for a Function Tool is a dictionary...
-                # If your function returns a type other than a dictionary, the framework automatically wraps it
-                # into a dictionary with a single key named "result"."
-                # Our LRFT initiator returns a dict. The FunctionResponse to the LLM should mirror what the LLM expects.
-                # The LlmAgent that called the LRFT expects the tool's output.
-                # Let's make the content of the FunctionResponse directly the string payload.
-                # The ADK will wrap it as `{"result": "string_payload"}` when it becomes tool_response for the LlmAgent.
-                
-                # The ADK example shows `updated_response.response = {'status': 'approved'}`
-                # This `response` dict is what the LLM gets as the tool's output.
-                # So, if our tool's "true" output (after LR processing) is a JSON string of URIs,
-                # then FunctionResponse.response should be `{"result": "JSON_STRING_OF_URIS"}`.
-                # Or, if the LlmAgent's instruction is to directly output the tool's raw JSON, then
-                # the `response` dict can be more complex if the LlmAgent is built to parse it.
-                # For LlmAgents that are simply told "call tool X and give me its output",
-                # they usually expect the direct output.
-
-                # Let's align with `DirectToolCallerBaseAgent`'s expectation: the final `output_state_key`
-                # stores the raw JSON string. So the LlmAgent calling the LRFT should ultimately get this string.
-                # Thus, the FunctionResponse part should provide this string.
-                # The ADK framework wraps a non-dict return into {"result": value}.
-                # So, if FunctionResponse.parts[0].function_response.response = "JSON_STRING_PAYLOAD",
-                # the LlmAgent might receive it as {"result": "JSON_STRING_PAYLOAD"}.
-                # If we set FunctionResponse.parts[0].function_response.response = {"final_uris_json": "JSON_STRING_PAYLOAD"},
-                # then the LlmAgent gets that dict.
-
-                # For simplicity, let the FunctionResponse's content BE the JSON string.
-                # The LlmAgent that called the LR Tool will receive this string,
-                # and its instruction will tell it to simply output this string (which goes into its output_key).
-                function_response_part = types.Part(
-                    function_response=types.FunctionResponse(
-                        id=original_tool_call_id, # Match the original tool call ID
-                        response=json.loads(final_result_payload) if isinstance(final_result_payload, str) else final_result_payload
-                        # The 'response' field here is the content passed to the LLM.
-                        # It should be a JSON-serializable dict.
-                        # Our final_result_payload is a JSON string. So we need to decide:
-                        # 1. Pass it as {"result": final_result_payload_string}
-                        # 2. Parse it into a dict/list if the LlmAgent expects that.
-                        # Given the LRToolCallerAgent expects the tool to "return a task ID and status"
-                        # and then "The tool will return ... This will be your output",
-                        # it means the *final* output of the LR tool (after client polling) should be the URIs.
-                        # So `response` here should be the actual data.
-                        # `final_result_payload` is already a JSON string that represents the tool's output.
-                        # If the LlmAgent expects a string, then this should be {"result": final_result_payload_string}
-                        # If the LlmAgent expects a list/dict, then this should be json.loads(final_result_payload_string)
-                        # Let's assume the LlmAgent (LRToolCaller) is simple and its output_key should get the direct JSON string.
-                        # So, `response` for FunctionResponse should be a dict like `{"tool_output_as_string": final_result_payload}`
-                        # or simply what the ADK wraps: if we provide `final_result_payload` (string), it becomes `{"result": final_result_payload}`.
-                        # Let's try `response={"result": final_result_payload}` where final_result_payload is the JSON *string*.
-                        # The LlmAgent that called initiate_..._tool will get this as its tool response.
-                        # Its instruction says "The tool will return a task ID and status. This will be your output."
-                        # This implies the initial output is the task_id.
-                        # And the *final* output after resolution should be the URIs.
-                        # So the LlmAgent's output_key should get the final URIs.
-                    )
-                )
-
-                logger.info(f"LR_CLIENT: Injecting FunctionResponse for task {task_id} (call_id: {original_tool_call_id}) into session {session_id} for user {user_id_for_task}.")
-                async for _ in runner.run_async( # We need to iterate to drive it
-                    session_id=session_id,
-                    user_id=user_id_for_task, # Use the correct user_id for this session
-                    new_message=types.Content(parts=[function_response_part], role='tool') # Use 'tool' role for FunctionResponse
-                ):
-                    pass # Consume events from this injection run
-
-                completed_indices.append(idx)
-                # Clean up from global tracking dicts
-                if tool_name == "long_running_image_generation_tool" and task_id in IMAGE_GENERATION_TASKS:
-                    del IMAGE_GENERATION_TASKS[task_id]
-                elif tool_name == "long_running_video_generation_tool" and task_id in VIDEO_GENERATION_TASKS:
-                    del VIDEO_GENERATION_TASKS[task_id]
-                # Add other LR tools here
-            elif not task_status_obj:
-                logger.warning(f"LR_CLIENT: Task {task_id} not found in tracking dictionary. Assuming lost/error.")
-                # Similar error injection as above might be needed. For now, mark as completed to remove from polling.
-                completed_indices.append(idx)
-
-
-        # Remove completed tasks from PENDING_LR_TASKS_FOR_CLIENT_POLLING
-        for i in sorted(completed_indices, reverse=True):
-            del PENDING_LR_TASKS_FOR_CLIENT_POLLING[session_id][i]
-        if not PENDING_LR_TASKS_FOR_CLIENT_POLLING[session_id]:
-            del PENDING_LR_TASKS_FOR_CLIENT_POLLING[session_id]
-
-
-
 # --- Agent Execution Helpers ---
 async def _run_agent_and_get_response(
     runner: Runner,
     session_id: str,
     content: types.Content,
-    # Add user_id for consistency with LR polling needs
-    user_id: str,
 ) -> List[str]:
-    logging.info(f"Running agent for session {session_id}, user {user_id}")
-    
-    # Initial run
-    current_events_stream = runner.run_async(
-        session_id=session_id, user_id=user_id, new_message=content
+    """
+    Runs the ADK agent asynchronously for a given session and content,
+    collecting and returning textual responses from the model.
+
+    Args:
+        runner: An instance of the ADK Runner.
+        session_id: The unique identifier for the current session.
+        content: The user's message/content to send to the agent.
+
+    Returns:
+        A list of strings, where each string is a part of the model's response.
+    """
+    logging.info("Running agent for session %s", session_id)
+    events_async = runner.run_async(
+        session_id=session_id, user_id=session_id, new_message=content
     )
+
     response_parts: List[str] = []
-    
-    # Loop to handle initial run and subsequent runs after LRFT responses are injected
-    while True:
-        has_more_events = False
-        async for event in current_events_stream:
-            has_more_events = True # Mark that we received events in this stream
-            # 1. Collect model's textual responses
-            if hasattr(event, "content") and event.content and event.content.role == "model":
+    async for event in events_async:
+        try:
+            if hasattr(event, "content") and event.content.role == "model":
                 if hasattr(event.content, "parts") and event.content.parts:
                     part_text = getattr(event.content.parts[0], "text", None)
                     if isinstance(part_text, str) and part_text:
-                        # Check if it's one of our LRFT pending messages
-                        if "pending_agent_client_action" not in part_text and \
-                           "Awaiting client polling" not in part_text:
-                            response_parts.append(part_text)
-                        else:
-                            logger.info(f"LR_CLIENT: Suppressing LRFT pending message from final output: {part_text}")
-
-            # 2. Detect if a LongRunningFunctionTool was called and needs polling
-            await _handle_long_running_tool_event(event, session_id, user_id, runner)
-
-        # 3. After processing all events from the current stream, check if we need to poll
-        if session_id in PENDING_LR_TASKS_FOR_CLIENT_POLLING and PENDING_LR_TASKS_FOR_CLIENT_POLLING[session_id]:
-            await _poll_and_inject_responses(session_id, runner)
-            # After injecting, we need to re-run the agent with no new user message
-            # to allow it to process the injected FunctionResponse.
-            # The previous `runner.run_async` inside `_poll_and_inject_responses` already does this.
-            # We need to ensure the main loop continues if there are still pending tasks.
-            # The _poll_and_inject_responses now iterates through runner.run_async for injections.
-            # After it finishes, if there are *still* pending tasks (e.g. one completed, another started), re-loop.
-            # Or, if the agent is now waiting for new user input but some LR tasks are backgrounded.
-            # The agent run will naturally end if it's awaiting user input. The LR tasks are external.
-
-            # Let's refine: the _run_agent_and_get_response should process one "turn".
-            # If that turn results in an LRFT call, PENDING_LR_TASKS_FOR_CLIENT_POLLING gets populated.
-            # The *caller* of _run_agent_and_get_response (e.g. websocket loop) should then manage the polling.
-
-            # For now, let's simplify the polling loop for _run_agent_and_get_response
-            # to handle only tasks initiated IN THIS CURRENT call.
-            # This simplified version will run, detect LR tasks, poll them to completion, then return.
-            # This makes _run_agent_and_get_response a blocking call from the perspective of LR tasks.
-            
-            # Revised loop for _run_agent_and_get_response:
-            # Keep running and polling until PENDING_LR_TASKS_FOR_CLIENT_POLLING for this session is empty.
-            # This means the agent might go through multiple internal "turns" if one LRFT completion
-            # leads to another agent calling another LRFT.
-            
-            # The `_poll_and_inject_responses` function now runs the agent internally.
-            # So, after it runs, we check PENDING_LR_TASKS_FOR_CLIENT_POLLING.
-            # If it's empty, the agent has completed all current LR branches or is awaiting user input.
-            if not (session_id in PENDING_LR_TASKS_FOR_CLIENT_POLLING and PENDING_LR_TASKS_FOR_CLIENT_POLLING[session_id]):
-                break # No more pending tasks for this session that this call initiated/polled.
-            else:
-                # If there are still pending tasks, it implies the agent hasn't produced its final textual response yet
-                # and is waiting for these other LR tasks. The polling will continue.
-                # We need a new stream from the runner for the next "natural" agent progression if any.
-                # This part is tricky. The `_poll_and_inject_responses` makes new `run_async` calls.
-                # The original `current_events_stream` is exhausted.
-                # For this simplified model, we assume one main user query leads to a set of LR tasks,
-                # they all get polled to completion, and then a final response is gathered.
-                # If an injected FunctionResponse causes the agent to call *another* LRFT,
-                # `_handle_long_running_tool_event` (called inside `_poll_and_inject_responses` indirectly)
-                # would add it to PENDING_LR_TASKS_FOR_CLIENT_POLLING.
-                logger.info(f"LR_CLIENT: Loop continuing in _run_agent_and_get_response as tasks for {session_id} are still pending.")
-                # We need to make sure we are not stuck if an agent is genuinely waiting for new user input
-                # while background tasks are still in PENDING_LR_TASKS_FOR_CLIENT_POLLING (e.g. user initiated 2 things).
-                # This simplified polling here assumes all LR tasks must resolve before this function returns.
-
-                # If `has_more_events` was false from the last stream, and we still have pending tasks,
-                # it means the agent is paused waiting for LR results. The poll will inject.
-                # We need to get a new stream for the agent's reaction to injected results if poll didn't run it.
-                # The `_poll_and_inject_responses` now runs the agent, so this is covered.
-                pass # Loop will continue if PENDING_LR_TASKS_FOR_CLIENT_POLLING is not empty.
-
-        elif not has_more_events and not (session_id in PENDING_LR_TASKS_FOR_CLIENT_POLLING and PENDING_LR_TASKS_FOR_CLIENT_POLLING[session_id]):
-            # No events from the last stream and no pending LR tasks for this session means agent is done for this "turn".
-            break
-        elif not has_more_events and (session_id in PENDING_LR_TASKS_FOR_CLIENT_POLLING and PENDING_LR_TASKS_FOR_CLIENT_POLLING[session_id]):
-            # Agent produced no new events (likely waiting), but we have LR tasks to poll.
-            # The main polling logic in _poll_and_inject_responses will run the agent again after injection.
-            await _poll_and_inject_responses(session_id, runner) # Ensure polling happens
-            if not (session_id in PENDING_LR_TASKS_FOR_CLIENT_POLLING):
-                break
-
-
-    logging.info(f"Agent run finished for session {session_id}. Responses: {len(response_parts)}")
+                        response_parts.append(part_text)
+        except AttributeError as e:
+            logging.warning("Could not process event attribute during agent run: %s", e)
+    logging.info("Agent run finished for session %s.", session_id)
     return response_parts
 
 
@@ -2437,7 +2133,7 @@ async def process_voice_query_with_adk(session_id: str, user_query: str) -> str:
             original_get_session = None # Reset global for the next potential call to process_voice_query_with_adk
 
 async def _get_runner_async(
-    loaded_mcp_tools: Dict[str, Any], session_id: str, query: str, user_id: str 
+    loaded_mcp_tools: Dict[str, Any], session_id: str, query: str
 ) -> List[str]:
     """
     Sets up and runs the root agent for a given query using preloaded tools.
@@ -2480,7 +2176,7 @@ async def _get_runner_async(
         session_service=session_service,
     )
     logging.info(f"TEXT_PATH: Runner created. Runner's session_service instance ID: {id(runner.session_service)}")
-    response = await _run_agent_and_get_response(runner, session_id, content, user_id)
+    response = await _run_agent_and_get_response(runner, session_id, content)
     return response
 
 
@@ -2542,7 +2238,7 @@ app.include_router(voice_agent_router) # The paths from voice_agent.py will be r
 
 # --- WebSocket Communication ---
 async def run_adk_agent_async(
-    websocket: WebSocket, loaded_mcp_tools: Dict[str, Any], session_id: str, user_id: str
+    websocket: WebSocket, loaded_mcp_tools: Dict[str, Any], session_id: str
 ) -> None:
     """
     Handles the continuous WebSocket communication loop for a connected client.
@@ -2558,36 +2254,27 @@ async def run_adk_agent_async(
     try:
         while True:
             text = await websocket.receive_text()
-            # Pass user_id to _get_runner_async
-            response_parts = await _get_runner_async(loaded_mcp_tools, session_id, text, user_id)
+            response_parts = await _get_runner_async(loaded_mcp_tools, session_id, text)
 
-            if not response_parts and not (session_id in PENDING_LR_TASKS_FOR_CLIENT_POLLING and PENDING_LR_TASKS_FOR_CLIENT_POLLING[session_id]):
-                # No text and no pending LR tasks for this session means agent is truly idle or finished.
-                # If there are pending tasks, the client is handling them, no text response yet.
-                logger.info("Agent for session %s did not produce text and no LR tasks pending after full processing.", session_id)
-                # Optionally send a "Thinking..." or no message.
-                # For now, only send if there are actual response parts.
-                # continue # Commented out to allow sending empty if no parts and no pending.
+            if not response_parts:
+                logging.info(
+                    "Agent for session %s did not produce a direct text response for input: '%s'",
+                    session_id,
+                    text[:50],
+                )
+                # Consider if a specific message should be sent or just wait for next input.
+                # For now, we assume if response_parts is empty, no direct message to user.
+                continue
 
-            # Only send message if there are parts. Suppress if only LR polling is happening.
-            if response_parts:
-                ai_message = "\n".join(response_parts)
-                await websocket.send_text(json.dumps({"message": ai_message}))
-            elif not (session_id in PENDING_LR_TASKS_FOR_CLIENT_POLLING and PENDING_LR_TASKS_FOR_CLIENT_POLLING[session_id]):
-                # If no response parts AND no pending LR tasks, send a generic ack or empty message if required by protocol
-                await websocket.send_text(json.dumps({"message": ""})) # Example: send empty if no text
-
-            await asyncio.sleep(0) # Yield control
+            ai_message = "\n".join(response_parts)
+            await websocket.send_text(json.dumps({"message": ai_message}))
+            await asyncio.sleep(0)
 
     except WebSocketDisconnect:
-        logger.info("Client %s disconnected from run_adk_agent_async.", session_id)
+        logging.info("Client %s disconnected from run_adk_agent_async.", session_id)
     finally:
-        # Clean up any pending tasks for this session if the WebSocket disconnects
-        if session_id in PENDING_LR_TASKS_FOR_CLIENT_POLLING:
-            logger.info(f"Cleaning up PENDING_LR_TASKS_FOR_CLIENT_POLLING for disconnected session {session_id}")
-            del PENDING_LR_TASKS_FOR_CLIENT_POLLING[session_id]
-        # Also cancel any actual asyncio background tasks associated with this session if possible (harder to track without more robust task management)
-        logger.info("Agent WebSocket task ending for session %s.", session_id)
+        logging.info("Agent WebSocket task ending for session %s.", session_id)
+
  
 @app.websocket("/ws/{session_id}")
 async def websocket_endpoint(websocket: WebSocket, session_id: str) -> None:
@@ -2603,7 +2290,6 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str) -> None:
         session_id: The unique session identifier passed in the URL path.
     """
     await websocket.accept()
-    user_id = session_id # Using session_id as user_id for this example
     logging.info("Client %s connected to WebSocket endpoint.", session_id)
     try:
         session_service.create_session(
@@ -2629,7 +2315,7 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str) -> None:
             await websocket.close(code=1011)
             return
 
-        await run_adk_agent_async(websocket, loaded_mcp_tools, session_id, user_id)
+        await run_adk_agent_async(websocket, loaded_mcp_tools, session_id)
 
     except WebSocketDisconnect:
         logging.info(
