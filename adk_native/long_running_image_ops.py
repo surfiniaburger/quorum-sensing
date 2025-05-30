@@ -11,7 +11,7 @@ import asyncio
 from datetime import datetime, UTC
 import hashlib
 
-import requests
+import requests # type: ignore
 from PIL import Image as PilImage # type: ignore
 from google.cloud import storage, secretmanager # type: ignore
 from google.api_core import exceptions as google_exceptions # type: ignore
@@ -22,7 +22,7 @@ from google.adk.tools.tool_context import ToolContext # type: ignore
 # --- Configuration (Copied from visual_asset_server.py, ensure these are accessible) ---
 GCP_PROJECT_ID = os.getenv("GOOGLE_CLOUD_PROJECT", "silver-455021")
 GCP_LOCATION = os.getenv("GCP_LOCATION", "us-central1")
-VERTEX_IMAGEN_MODEL_ID = os.getenv("VERTEX_IMAGEN_MODEL", "imagen-3.0-generate-002") # Corrected model ID
+VERTEX_IMAGEN_MODEL_ID = os.getenv("VERTEX_IMAGEN_MODEL", "imagen-3.0-generate-002")
 GCS_BUCKET_GENERATED_ASSETS = os.getenv("GCS_BUCKET_GENERATED_ASSETS", "mlb_generated_assets")
 
 CLOUDFLARE_ACCOUNT_ID_SECRET = os.getenv("CLOUDFLARE_ACCOUNT_ID_SECRET", "cloudflare-account-id")
@@ -35,19 +35,15 @@ IMAGE_GENERATION_WATERMARK = False
 IMAGE_GENERATION_NEGATIVE_PROMPT = "text, words, letters, blurry, low quality, cartoonish, illustration, drawing, sketch, unrealistic, watermark, signature, writing"
 IMAGE_GENERATION_ASPECT_RATIO = "16:9"
 IMAGE_GENERATION_NUMBER_PER_PROMPT = 1
-IMAGE_GENERATION_SLEEP_SECONDS = int(os.getenv("IMAGE_GENERATION_SLEEP_SECONDS_NATIVE", 5)) # Reduced for potential faster local/async ops
+IMAGE_GENERATION_SLEEP_SECONDS = int(os.getenv("IMAGE_GENERATION_SLEEP_SECONDS_NATIVE", 5))
 IMAGE_GENERATION_ERROR_SLEEP_SECONDS = int(os.getenv("IMAGE_GENERATION_ERROR_SLEEP_SECONDS_NATIVE", 2))
 IMAGE_GENERATION_QUOTA_SLEEP_SECONDS = int(os.getenv("IMAGE_GENERATION_QUOTA_SLEEP_SECONDS_NATIVE", 65))
 CLOUDFLARE_FALLBACK_SLEEP_SECONDS = int(os.getenv("CLOUDFLARE_FALLBACK_SLEEP_SECONDS_NATIVE", 2))
 
 logger = logging.getLogger(__name__)
 
-# --- Global Task Tracking ---
-# In a production scenario, use a more robust shared store like Redis or a database.
 IMAGE_GENERATION_TASKS: Dict[str, Dict[str, Any]] = {}
 
-# --- Client Initialization (Simplified for ADK context, ensure they are initialized once globally if possible) ---
-# These would ideally be managed and passed around or accessed via a global context if not using MCP's singleton style
 storage_client_instance = None
 imagen_model_instance = None
 secret_manager_client_instance = None
@@ -67,7 +63,7 @@ def ensure_clients_initialized():
             imagen_model_instance = ImageGenerationModel.from_pretrained(VERTEX_IMAGEN_MODEL_ID)
         except Exception as e:
             logger.error(f"Failed to initialize Imagen model: {e}")
-            imagen_model_instance = None # Ensure it's None if init fails
+            imagen_model_instance = None
     if not secret_manager_client_instance:
         secret_manager_client_instance = secretmanager.SecretManagerServiceClient()
 
@@ -78,7 +74,6 @@ def ensure_clients_initialized():
 
     if not imagen_model_instance and not (cloudflare_account_id_global and cloudflare_api_token_global):
         logger.warning("Neither Imagen nor Cloudflare fallback is available for image generation.")
-
 
 def _access_secret_version_sync(project_id: str, secret_id: str, version_id: str = "latest") -> Optional[str]:
     if not secret_manager_client_instance: return None
@@ -101,12 +96,16 @@ async def _save_image_to_gcs_native(image_bytes: bytes, bucket_name: str, blob_n
         await asyncio.to_thread(
             blob.upload_from_string,
             image_bytes,
-            content_type=content_type
+            content_type=content_type,
+            timeout=180  # Increased timeout to 3 minutes
         )
         gcs_uri = f"gs://{bucket_name}/{blob_name}"
         logger.info(f"Successfully saved image to {gcs_uri}")
         return gcs_uri
-    except Exception as e:
+    except google_exceptions.TimeoutError as e: # More specific timeout exception from google-api-core
+        logger.error(f"GCS upload timeout for gs://{bucket_name}/{blob_name}: {e}", exc_info=True)
+        return None
+    except Exception as e: # Catch other potential exceptions during upload
         logger.error(f"Error saving image to GCS gs://{bucket_name}/{blob_name}: {e}", exc_info=True)
         return None
 
@@ -118,7 +117,7 @@ async def _generate_image_cloudflare_native(prompt: str, width: int = 768, heigh
     data = {"prompt": prompt, "width": width, "height": height, "num_steps": num_steps}
     try:
         response = await asyncio.to_thread(
-            requests.post, url, headers=headers, json=data, timeout=60 # type: ignore
+            requests.post, url, headers=headers, json=data, timeout=60
         )
         if response.status_code == 200:
             return response.content
@@ -130,7 +129,6 @@ async def _generate_image_cloudflare_native(prompt: str, width: int = 768, heigh
         return None
 
 async def _perform_image_generation_work(task_id: str, prompts: List[str], game_pk_str: str):
-    """The actual image generation logic, runs as a background asyncio task."""
     ensure_clients_initialized()
     IMAGE_GENERATION_TASKS[task_id]["status"] = "processing"
     generated_uris: List[str] = []
@@ -154,16 +152,16 @@ async def _perform_image_generation_work(task_id: str, prompts: List[str], game_
         if imagen_model_instance:
             try:
                 current_seed = IMAGE_GENERATION_SEED
-                if current_seed is None and not IMAGE_GENERATION_WATERMARK: # type: ignore
+                if current_seed is None and not IMAGE_GENERATION_WATERMARK:
                     current_seed = random.randint(1, 2**31 - 1)
 
                 response = await asyncio.to_thread(
-                    imagen_model_instance.generate_images, # type: ignore
+                    imagen_model_instance.generate_images,
                     prompt=prompt_text,
                     seed=current_seed,
                     number_of_images=generation_params["number_of_images"],
                     aspect_ratio=generation_params["aspect_ratio"],
-                    add_watermark=generation_params["add_watermark"], # type: ignore
+                    add_watermark=generation_params["add_watermark"],
                     negative_prompt=generation_params["negative_prompt"]
                 )
                 if response and response.images:
@@ -186,18 +184,15 @@ async def _perform_image_generation_work(task_id: str, prompts: List[str], game_
                     await asyncio.sleep(IMAGE_GENERATION_SLEEP_SECONDS)
                 else:
                     logger.warning(f"[Task {task_id}] Imagen returned no image for prompt {i+1}.")
-
-
             except google_exceptions.ResourceExhausted as quota_error:
                 err_msg = f"Imagen Quota Exceeded for prompt {i+1}: {quota_error}"
                 logger.error(f"[Task {task_id}] {err_msg}")
                 errors.append(err_msg)
                 await asyncio.sleep(IMAGE_GENERATION_QUOTA_SLEEP_SECONDS)
-                continue # Skip to next prompt
+                continue
             except Exception as e:
                 logger.error(f"[Task {task_id}] Unexpected Imagen Error for prompt {i+1}: {e}", exc_info=True)
                 await asyncio.sleep(IMAGE_GENERATION_ERROR_SLEEP_SECONDS)
-                # Attempt fallback
 
         if not imagen_succeeded:
             if cloudflare_account_id_global and cloudflare_api_token_global:
@@ -218,7 +213,6 @@ async def _perform_image_generation_work(task_id: str, prompts: List[str], game_
                 logger.warning(f"[Task {task_id}] {err_msg}")
                 errors.append(err_msg)
 
-
         if image_bytes and model_used:
             try:
                 prompt_slug = re.sub(r'\W+', '_', prompt_text[:30]).strip('_')
@@ -229,50 +223,45 @@ async def _perform_image_generation_work(task_id: str, prompts: List[str], game_
                 if gcs_uri:
                     generated_uris.append(gcs_uri)
                 else:
-                    err_msg = f"Failed to save image from {model_used} to GCS for prompt {i+1}."
+                    err_msg = f"Failed to save image from {model_used} to GCS for prompt {i+1} (GCS URI was None)."
                     logger.warning(f"[Task {task_id}] {err_msg}")
                     errors.append(err_msg)
             except Exception as save_err:
-                err_msg = f"Failed to save image from {model_used} for prompt {i+1}: {save_err}"
+                err_msg = f"Exception during GCS save for image from {model_used} for prompt {i+1}: {save_err}"
                 logger.error(f"[Task {task_id}] {err_msg}", exc_info=True)
                 errors.append(err_msg)
 
     if not generated_uris and errors:
         IMAGE_GENERATION_TASKS[task_id].update({
             "status": "failed",
-            "error": "; ".join(errors)
+            "error": "; ".join(errors) if errors else "Image generation failed with no specific GCS URIs and no specific errors captured."
         })
-    else:
+    elif errors: # Some URIs might have been generated, but some errors also occurred
+        IMAGE_GENERATION_TASKS[task_id].update({
+            "status": "completed_with_errors",
+            "result": json.dumps(generated_uris),
+            "errors": errors
+        })
+    else: # All successful
         IMAGE_GENERATION_TASKS[task_id].update({
             "status": "completed",
-            "result": json.dumps(generated_uris), # Result should be JSON serializable string
-            "errors": errors
+            "result": json.dumps(generated_uris),
+            "errors": []
         })
     logger.info(f"[Task {task_id}] Image generation work finished. Status: {IMAGE_GENERATION_TASKS[task_id]['status']}")
 
-
 def initiate_image_generation(prompts: List[str], game_pk_str: str = "unknown_game", tool_context: Optional[ToolContext] = None) -> Dict[str, Any]:
-    """
-    Initiates background image generation for a list of prompts.
-    This function is intended to be wrapped by ADK's LongRunningFunctionTool.
-    """
     ensure_clients_initialized()
     if not isinstance(prompts, list) or not all(isinstance(p, str) for p in prompts):
         logger.error(f"LRFT:init_image_gen: Invalid 'prompts' type. Expected List[str], got {type(prompts)}. Value: {prompts}")
-        # This error occurs before task_id is created, so client won't poll.
-        # Tool should return error directly if ADK allows, or LLM must handle.
-        # For now, let's assume the LLM calling this tool gets valid list.
-        # A Pydantic model on the LlmAgent using this tool would enforce this.
         return {"status": "error", "message": "Invalid prompts input. Must be a list of strings."}
 
     if not prompts:
-        return {"status": "completed", "result": json.dumps([])} # No work to do
+        return {"status": "completed", "result": json.dumps([])}
 
-    # Use a portion of the hash of the prompts list and timestamp for a more unique ID if needed
     prompt_hash_part = hashlib.md5(json.dumps(sorted(prompts)).encode()).hexdigest()[:8]
     task_id = f"img_task_{prompt_hash_part}_{int(time.time())}"
-
-    agent_name = tool_context.agent_name if tool_context else "UnknownAgent"
+    agent_name = tool_context.agent_name if tool_context and hasattr(tool_context, 'agent_name') else "UnknownAgentFromToolContext"
     logger.info(f"LRFT:init_image_gen (Agent: {agent_name}): Initiating task {task_id} for {len(prompts)} prompts, game {game_pk_str}.")
 
     IMAGE_GENERATION_TASKS[task_id] = {
@@ -280,13 +269,12 @@ def initiate_image_generation(prompts: List[str], game_pk_str: str = "unknown_ga
         "prompts": prompts,
         "game_pk_str": game_pk_str,
         "start_time": time.time(),
-        "tool_call_id": tool_context.id if tool_context else None # Store original tool call ID
     }
     asyncio.create_task(_perform_image_generation_work(task_id, prompts, game_pk_str))
 
     return {
-        "status": "pending_agent_client_action", # Signal that the agent client needs to poll
+        "status": "pending_agent_client_action",
         "task_id": task_id,
-        "tool_name": "long_running_image_generation_tool", # For client to identify
+        "tool_name": "initiate_image_generation",
         "message": f"Image generation task {task_id} initiated for {len(prompts)} prompts. Awaiting client polling."
     }
