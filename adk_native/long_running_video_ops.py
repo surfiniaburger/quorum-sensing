@@ -164,7 +164,7 @@ def initiate_video_generation(prompts: List[str], game_pk_str: str = "unknown_ga
     Initiates background video generation for a list of prompts.
     This function is intended to be wrapped by ADK's LongRunningFunctionTool.
     """
-    ensure_video_clients_initialized()
+    ensure_video_clients_initialized() # Ensure this is called
     if not isinstance(prompts, list) or not all(isinstance(p, str) for p in prompts):
         return {"status": "error", "message": "Invalid prompts input. Must be a list of strings."}
 
@@ -174,7 +174,7 @@ def initiate_video_generation(prompts: List[str], game_pk_str: str = "unknown_ga
     prompt_hash_part = hashlib.md5(json.dumps(sorted(prompts)).encode()).hexdigest()[:8]
     task_id = f"vid_task_{prompt_hash_part}_{int(time.time())}"
     
-    agent_name = tool_context.agent_name if tool_context else "UnknownAgent"
+    agent_name = tool_context.agent_name if tool_context and hasattr(tool_context, 'agent_name') else "UnknownAgentFromToolContext"
     logger.info(f"LRFT:init_video_gen (Agent: {agent_name}): Initiating task {task_id} for {len(prompts)} prompts, game {game_pk_str}.")
 
     VIDEO_GENERATION_TASKS[task_id] = {
@@ -182,13 +182,13 @@ def initiate_video_generation(prompts: List[str], game_pk_str: str = "unknown_ga
         "prompts": prompts,
         "game_pk_str": game_pk_str,
         "start_time": time.time(),
-        "tool_call_id": tool_context.id if tool_context else None
+        # REMOVED: "tool_call_id": tool_context.id if tool_context else None
     }
     asyncio.create_task(_perform_video_generation_work(task_id, prompts, game_pk_str))
 
     return {
         "status": "pending_agent_client_action",
         "task_id": task_id,
-        "tool_name": "long_running_video_generation_tool",
+        "tool_name": "initiate_video_generation", # This name is used by the client polling logic
         "message": f"Video generation task {task_id} initiated for {len(prompts)} prompts. Awaiting client polling."
     }

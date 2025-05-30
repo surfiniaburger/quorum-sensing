@@ -29,6 +29,10 @@ import hashlib # For task ID generation if not already there
 from google.adk.tools import LongRunningFunctionTool
 from adk_native.long_running_image_ops import initiate_image_generation, IMAGE_GENERATION_TASKS
 from adk_native.long_running_video_ops import initiate_video_generation, VIDEO_GENERATION_TASKS
+from adk_native.long_running_audio_ops import (
+    initiate_tts_generation, TTS_GENERATION_TASKS,
+    initiate_stt_transcription, STT_TRANSCRIPTION_TASKS
+)
 import logging
 
 
@@ -112,6 +116,8 @@ server_configs_instance = AllServerConfigs(
 # --- Define LongRunningFunctionTool instances ---
 long_running_image_tool = LongRunningFunctionTool(func=initiate_image_generation)
 long_running_video_tool = LongRunningFunctionTool(func=initiate_video_generation)
+long_running_tts_tool = LongRunningFunctionTool(func=initiate_tts_generation)
+long_running_stt_tool = LongRunningFunctionTool(func=initiate_stt_transcription)
 
 
 
@@ -1430,7 +1436,7 @@ Your entire job is to make this single tool call. Do not respond with text.
 The tool will return a task ID and status. This will be your output.
         """,
         tools=[long_running_image_tool], # Pass the ADK LongRunningFunctionTool
-        output_key="image_generation_lr_task_submission_details" # Will contain {"status": "pending_agent_client_action", "task_id": ...}
+        output_key="final_image_uris_from_lr_tool_json_string" # Will contain {"status": "pending_agent_client_action", "task_id": ...}
     )
 
     # Create the sequential agent for one pass of image generation initiation and result collection
@@ -1453,7 +1459,7 @@ Output a brief status message like "Processed N image URIs." or "Image generatio
         # This LlmAgent approach is a bit forced for simple data manipulation. A BaseAgent would be cleaner.
         output_key="image_result_processing_status"
     )
-
+# final_image_uris_from_lr_tool_json_string
 
     iterative_image_generation_pipeline_components = [
         generated_visual_prompts_agent, # Generates prompts into `visual_generation_prompts_json`
@@ -1516,7 +1522,7 @@ Your entire job is to make this single tool call. Do not respond with text.
 The tool will return a task ID and status. This will be your output.
         """,
         tools=[long_running_video_tool],
-        output_key="video_generation_lr_task_submission_details"
+        output_key="final_video_uris_from_lr_tool_json_string"
     )
 
     video_generation_initiation_sequence = SequentialAgent(
@@ -1920,21 +1926,6 @@ Output ONLY the JSON string list.
         description="Generates dialogue audio and then corresponding word timestamps."
     )
 
-    # --- Update ParallelAssetPipelinesAgent ---
-    parallel_asset_pipelines_instance = ParallelAgent(
-        name="ParallelAssetGenerationPipelines",
-        sub_agents=[
-            static_asset_pipeline_agent_instance,         # Unchanged in its LR nature (uses LlmAgents for tools)
-            image_generation_initiation_sequence,         # NEW: Initiates LR image gen
-            video_generation_initiation_sequence,         # NEW: Initiates LR video gen
-            # audio_processing_pipeline_for_parallel_instance, # This was sequential TTS then STT
-          #  text_to_speech_adk_native_agent, # NEW: Initiates LR TTS
-            # STT depends on TTS result, so it cannot be in this parallel set directly if TTS is LR.
-            # STT initiation will happen *after* TTS LR is resolved.
-            graph_generation_pipeline_agent_instance      # Unchanged
-        ],
-        description="Concurrently initiates generation of static assets, images, videos, audio (TTS), and graphs."
-    )
 
     # The GameRecapAgentV2 sequence needs to be adjusted:
     # 1. Script Generation
@@ -1975,25 +1966,102 @@ Format them into 'final_video_assets_list'.
 Output: 'Video results processed.'""",
         output_key="video_final_result_processing_status"
     )
+  # == TTS REVISED (using LRFT) ==
+    tts_lr_tool_caller_agent = LlmAgent(
+        name="TTSLRToolCaller", model=GEMINI_FLASH_MODEL_ID,
+        instruction="""Audio synthesis robot.
+Read current recap from session state key 'current_recap'.
+Read game PK from session state key 'game_pk'.
+You MUST call the 'initiate_tts_generation' tool with the script and game_pk_str.
+Your output will be the initial response from the tool (task details).""",
+        tools=[long_running_tts_tool],
+        output_key="tts_lr_task_submission_details" # Stores the initial {"status": "pending...", "task_id": ...}
+    )
+
+    # This agent is part of the main sequence AFTER client polling resolves the TTS task.
     tts_final_result_processor = LlmAgent(
         name="TTSFinalResultProcessor", model=GEMINI_FLASH_MODEL_ID,
         instruction="""You are a data processor.
-Read TTS audio URI from session state '{tts_lr_tool_caller_agent_output_key}'.
-Store it in 'generated_dialogue_audio_uri'.
-Output: 'TTS result processed.'""",
+The TTS generation tool has completed. Its output (a JSON string with 'audio_uri' or 'error')
+is in session state key '{tts_lr_task_submission_details_resolved_output_key}'.
+Parse this JSON string. If successful and an 'audio_uri' is present,
+store this URI in session state key 'generated_dialogue_audio_uri'.
+If there was an error or no URI, log it and ensure 'generated_dialogue_audio_uri' is None or reflects the error.
+Output: 'TTS result processed, audio URI set.' or 'TTS processing failed.'""",
+        # The input state key needs to be the output_key of tts_lr_tool_caller_agent
+        # AFTER it has processed the injected FunctionResponse.
+        # Let's rename tts_lr_tool_caller_agent.output_key to:
+        # output_key="final_tts_details_from_lr_tool_json_string"
+        # And update the instruction to use this.
         output_key="tts_final_result_processing_status"
     )
-    # This agent would then trigger the STT LR tool call.
-  #  stt_initiation_after_tts_agent = speech_to_timestamps_adk_native_agent # Re-use the STT initiation sequence
+    # Modify tts_lr_tool_caller_agent.output_key:
+    # tts_lr_tool_caller_agent.output_key = "final_tts_details_from_lr_tool_json_string"
+    # And the instruction for tts_final_result_processor should use this new key.
+    # This change would be:
+    # instruction="...is in session state key 'final_tts_details_from_lr_tool_json_string'..."
+
+
+    # == STT REVISED (using LRFT) ==
+    stt_lr_tool_caller_agent = LlmAgent(
+        name="STTLRToolCaller", model=GEMINI_FLASH_MODEL_ID,
+        instruction="""Audio transcription robot.
+Read the generated audio GCS URI from session state key 'generated_dialogue_audio_uri'.
+If the URI is present, you MUST call the 'initiate_stt_transcription' tool with the audio_gcs_uri.
+If no URI is present, output 'Skipping STT as no audio URI found.'
+Your tool call output will be the initial response from the tool (task details).""",
+        tools=[long_running_stt_tool],
+        output_key="stt_lr_task_submission_details" # Stores initial {"status": "pending...", "task_id": ...}
+    )
 
     stt_final_result_processor = LlmAgent(
         name="STTFinalResultProcessor", model=GEMINI_FLASH_MODEL_ID,
         instruction="""You are a data processor.
-Read STT timestamps from session state '{stt_lr_tool_caller_agent_output_key}'.
-Store it in 'word_timestamps_list'.
-Output: 'STT result processed.'""",
+The STT transcription tool has completed. Its output (a JSON string list of word timestamps or an error)
+is in session state key '{stt_lr_task_submission_details_resolved_output_key}'.
+Parse this JSON string. If successful, store the list of timestamps in session state key 'word_timestamps_list'.
+If there was an error, ensure 'word_timestamps_list' is empty or reflects the error.
+Output: 'STT result processed, timestamps stored.' or 'STT processing failed.'""",
+        # Similar to TTS, the input key here should be stt_lr_tool_caller_agent.output_key
+        # after it processes the injected FunctionResponse. Let's call it:
+        # "final_stt_timestamps_from_lr_tool_json_string"
         output_key="stt_final_result_processing_status"
     )
+
+    # Update LlmAgent output keys for clarity when they are resolved by LRFT
+    image_generation_lr_tool_caller_agent.output_key = "final_image_uris_from_lr_tool_json_string"
+    video_generation_lr_tool_caller_agent.output_key = "final_video_uris_from_lr_tool_json_string"
+    tts_lr_tool_caller_agent.output_key = "final_tts_details_from_lr_tool_json_string"
+    stt_lr_tool_caller_agent.output_key = "final_stt_timestamps_from_lr_tool_json_string"
+
+    # Update instructions for processor agents to use these new output_keys
+    image_final_result_processor.instruction = image_final_result_processor.instruction.replace(
+        '{image_generation_lr_tool_caller_agent_output_key}', image_generation_lr_tool_caller_agent.output_key
+    )
+    video_final_result_processor.instruction = video_final_result_processor.instruction.replace(
+        '{video_generation_lr_tool_caller_agent_output_key}', video_generation_lr_tool_caller_agent.output_key
+    )
+    tts_final_result_processor.instruction = tts_final_result_processor.instruction.replace(
+        '{tts_lr_tool_caller_agent_output_key}', tts_lr_tool_caller_agent.output_key
+    )
+    stt_final_result_processor.instruction = stt_final_result_processor.instruction.replace(
+        '{stt_lr_tool_caller_agent_output_key}', stt_lr_tool_caller_agent.output_key
+    )
+
+    # --- Update ParallelAssetPipelinesAgent ---
+    parallel_asset_pipelines_instance = ParallelAgent(
+        name="ParallelAssetGenerationPipelines",
+        sub_agents=[
+            static_asset_pipeline_agent_instance,         # Unchanged in its LR nature (uses LlmAgents for tools)
+            image_generation_initiation_sequence,         # NEW: Initiates LR image gen
+            video_generation_initiation_sequence,         # NEW: Initiates LR video gen
+            tts_lr_tool_caller_agent,      
+            graph_generation_pipeline_agent_instance      # Unchanged
+        ],
+        description="Concurrently initiates generation of static assets, images, videos, audio (TTS), and graphs."
+    )
+
+
     asset_aggregator_agent_instance = AssetAggregatorAgent(name="AssetAggregator") # Defined above
     # New GameRecapAgentV2 structure
     game_recap_assistant_v2 = SequentialAgent(
@@ -2004,12 +2072,10 @@ Output: 'STT result processed.'""",
             # --- Client Polling Happens Here for Image, Video, TTS, Graph LR tasks ---
             image_final_result_processor,              # Processes results of image LR task
             video_final_result_processor,              # Processes results of video LR task
-           # tts_final_result_processor,                # Processes results of TTS LR task
-         #   stt_initiation_after_tts_agent,            # Initiates STT LR task (uses TTS result)
-            # --- Client Polling Happens Here for STT LR task ---
-           # stt_final_result_processor,                # Processes results of STT LR task
-            # The critique and refinement for images would go here, potentially in a LoopAgent
-            # For now, simplified:
+            tts_final_result_processor,        # Processes TTS results, sets 'generated_dialogue_audio_uri'
+            stt_lr_tool_caller_agent,          # Initiates STT LR task (uses 'generated_dialogue_audio_uri')
+            # Client polling happens again for STT
+            stt_final_result_processor,        # Processes STT results, sets 'word_timestamps_list'
             visual_critic_agent,                       # Critiques images based on results from image_final_result_processor
             new_visual_prompts_from_critique_agent,    # Creates new prompts (not used in a loop in this simplified version)
            # asset_validator_instance,                  # Validates all collected assets
@@ -2091,121 +2157,40 @@ async def _handle_long_running_tool_event(event: Event, session_id: str, user_id
     return False
 
 
-async def _poll_and_inject_responses(session_id: str, runner: Runner):
-    if session_id in PENDING_LR_TASKS_FOR_CLIENT_POLLING and PENDING_LR_TASKS_FOR_CLIENT_POLLING[session_id]:
-        completed_indices = []
-        for idx, task_details in enumerate(PENDING_LR_TASKS_FOR_CLIENT_POLLING[session_id]):
-            task_id = task_details["task_id"]
-            tool_name = task_details["tool_name"]
-            original_tool_call_id = task_details["original_tool_call_id"]
-            user_id_for_task = task_details["user_id"] # Retrieve stored user_id
+from google.genai import types as genai_types # Explicit import for clarity
 
-            task_status_obj = None
-            final_result_payload = None
+def get_lr_function_call_if_any(event: Event, lr_tool_names: List[str]) -> Optional[genai_types.FunctionCall]:
+    """
+    Checks if the event contains a FunctionCall to one of the specified LongRunningFunctionTool names.
+    event.long_running_tool_ids signals that a call *to an LRFT* was made.
+    We also check the name to ensure it's one we are managing with client-side polling.
+    """
+    if not event.long_running_tool_ids or not event.content or not event.content.parts:
+        return None
+    for part in event.content.parts:
+        if (
+            part.function_call
+            and part.function_call.id in event.long_running_tool_ids
+            and part.function_call.name in lr_tool_names
+        ):
+            logger.debug(f"LR_HELPER: Identified LR FunctionCall: ID={part.function_call.id}, Name={part.function_call.name}")
+            return part.function_call
+    return None
 
-            if tool_name == "long_running_image_generation_tool":
-                task_status_obj = IMAGE_GENERATION_TASKS.get(task_id)
-            elif tool_name == "long_running_video_generation_tool":
-                task_status_obj = VIDEO_GENERATION_TASKS.get(task_id)
-            # Add other LR tools here (TTS, STT)
-
-            if task_status_obj and task_status_obj.get("status") in ["completed", "failed"]:
-                logger.info(f"LR_CLIENT: Task {task_id} ({tool_name}) completed with status: {task_status_obj['status']}.")
-                if task_status_obj["status"] == "completed":
-                    final_result_payload = task_status_obj.get("result", "{}") # Should be JSON string
-                else: # failed
-                    final_result_payload = json.dumps({"error": task_status_obj.get("error", "Unknown error")})
-
-                # Create FunctionResponse
-                # The 'response' field within FunctionResponse should be a Dict for the ADK.
-                # Our LRFTs are designed to output a JSON string as their "result".
-                # The LLM that called the LRFT expects the tool's output (the FunctionResponse.response.result content)
-                # to be that JSON string.
-                # So, FunctionResponse.response should be {"result": "the_json_string_from_our_task"}
-                # However, the ADK docs state: "The preferred return type for a Function Tool is a dictionary...
-                # If your function returns a type other than a dictionary, the framework automatically wraps it
-                # into a dictionary with a single key named "result"."
-                # Our LRFT initiator returns a dict. The FunctionResponse to the LLM should mirror what the LLM expects.
-                # The LlmAgent that called the LRFT expects the tool's output.
-                # Let's make the content of the FunctionResponse directly the string payload.
-                # The ADK will wrap it as `{"result": "string_payload"}` when it becomes tool_response for the LlmAgent.
-                
-                # The ADK example shows `updated_response.response = {'status': 'approved'}`
-                # This `response` dict is what the LLM gets as the tool's output.
-                # So, if our tool's "true" output (after LR processing) is a JSON string of URIs,
-                # then FunctionResponse.response should be `{"result": "JSON_STRING_OF_URIS"}`.
-                # Or, if the LlmAgent's instruction is to directly output the tool's raw JSON, then
-                # the `response` dict can be more complex if the LlmAgent is built to parse it.
-                # For LlmAgents that are simply told "call tool X and give me its output",
-                # they usually expect the direct output.
-
-                # Let's align with `DirectToolCallerBaseAgent`'s expectation: the final `output_state_key`
-                # stores the raw JSON string. So the LlmAgent calling the LRFT should ultimately get this string.
-                # Thus, the FunctionResponse part should provide this string.
-                # The ADK framework wraps a non-dict return into {"result": value}.
-                # So, if FunctionResponse.parts[0].function_response.response = "JSON_STRING_PAYLOAD",
-                # the LlmAgent might receive it as {"result": "JSON_STRING_PAYLOAD"}.
-                # If we set FunctionResponse.parts[0].function_response.response = {"final_uris_json": "JSON_STRING_PAYLOAD"},
-                # then the LlmAgent gets that dict.
-
-                # For simplicity, let the FunctionResponse's content BE the JSON string.
-                # The LlmAgent that called the LR Tool will receive this string,
-                # and its instruction will tell it to simply output this string (which goes into its output_key).
-                function_response_part = types.Part(
-                    function_response=types.FunctionResponse(
-                        id=original_tool_call_id, # Match the original tool call ID
-                        response=json.loads(final_result_payload) if isinstance(final_result_payload, str) else final_result_payload
-                        # The 'response' field here is the content passed to the LLM.
-                        # It should be a JSON-serializable dict.
-                        # Our final_result_payload is a JSON string. So we need to decide:
-                        # 1. Pass it as {"result": final_result_payload_string}
-                        # 2. Parse it into a dict/list if the LlmAgent expects that.
-                        # Given the LRToolCallerAgent expects the tool to "return a task ID and status"
-                        # and then "The tool will return ... This will be your output",
-                        # it means the *final* output of the LR tool (after client polling) should be the URIs.
-                        # So `response` here should be the actual data.
-                        # `final_result_payload` is already a JSON string that represents the tool's output.
-                        # If the LlmAgent expects a string, then this should be {"result": final_result_payload_string}
-                        # If the LlmAgent expects a list/dict, then this should be json.loads(final_result_payload_string)
-                        # Let's assume the LlmAgent (LRToolCaller) is simple and its output_key should get the direct JSON string.
-                        # So, `response` for FunctionResponse should be a dict like `{"tool_output_as_string": final_result_payload}`
-                        # or simply what the ADK wraps: if we provide `final_result_payload` (string), it becomes `{"result": final_result_payload}`.
-                        # Let's try `response={"result": final_result_payload}` where final_result_payload is the JSON *string*.
-                        # The LlmAgent that called initiate_..._tool will get this as its tool response.
-                        # Its instruction says "The tool will return a task ID and status. This will be your output."
-                        # This implies the initial output is the task_id.
-                        # And the *final* output after resolution should be the URIs.
-                        # So the LlmAgent's output_key should get the final URIs.
-                    )
-                )
-
-                logger.info(f"LR_CLIENT: Injecting FunctionResponse for task {task_id} (call_id: {original_tool_call_id}) into session {session_id} for user {user_id_for_task}.")
-                async for _ in runner.run_async( # We need to iterate to drive it
-                    session_id=session_id,
-                    user_id=user_id_for_task, # Use the correct user_id for this session
-                    new_message=types.Content(parts=[function_response_part], role='tool') # Use 'tool' role for FunctionResponse
-                ):
-                    pass # Consume events from this injection run
-
-                completed_indices.append(idx)
-                # Clean up from global tracking dicts
-                if tool_name == "long_running_image_generation_tool" and task_id in IMAGE_GENERATION_TASKS:
-                    del IMAGE_GENERATION_TASKS[task_id]
-                elif tool_name == "long_running_video_generation_tool" and task_id in VIDEO_GENERATION_TASKS:
-                    del VIDEO_GENERATION_TASKS[task_id]
-                # Add other LR tools here
-            elif not task_status_obj:
-                logger.warning(f"LR_CLIENT: Task {task_id} not found in tracking dictionary. Assuming lost/error.")
-                # Similar error injection as above might be needed. For now, mark as completed to remove from polling.
-                completed_indices.append(idx)
-
-
-        # Remove completed tasks from PENDING_LR_TASKS_FOR_CLIENT_POLLING
-        for i in sorted(completed_indices, reverse=True):
-            del PENDING_LR_TASKS_FOR_CLIENT_POLLING[session_id][i]
-        if not PENDING_LR_TASKS_FOR_CLIENT_POLLING[session_id]:
-            del PENDING_LR_TASKS_FOR_CLIENT_POLLING[session_id]
-
+def get_lr_initiator_function_response(event: Event, original_call_id: str) -> Optional[genai_types.FunctionResponse]:
+    """
+    Gets the FunctionResponse from the LRFT's initiator function, matching the original_call_id.
+    """
+    if not event.content or not event.content.parts:
+        return None
+    for part in event.content.parts:
+        if (
+            part.function_response
+            and part.function_response.id == original_call_id
+        ):
+            logger.debug(f"LR_HELPER: Identified LR Initiator FunctionResponse: ID={part.function_response.id}, Name={part.function_response.name}")
+            return part.function_response
+    return None
 
 
 # --- Agent Execution Helpers ---
@@ -2215,101 +2200,229 @@ async def _run_agent_and_get_response(
     content: types.Content,
     # Add user_id for consistency with LR polling needs
     user_id: str,
+        # List of your LRFT tool names that require client polling
+    managed_lr_tool_names: List[str] = [
+        "initiate_image_generation",
+        "initiate_video_generation",
+        "initiate_tts_generation", # Add TTS initiator name
+        "initiate_stt_transcription"  # Add STT initiator name
+    ]
 ) -> List[str]:
-    logging.info(f"Running agent for session {session_id}, user {user_id}")
+    logger.info(f"AGENT_RUN: Starting for session {session_id}, user {user_id}. Initial message: {content.parts[0].text if content.parts else 'no text'}")
+    response_parts: List[str] = []
     
-    # Initial run
+    # Variables to track the state of handling one LRFT at a time per "turn"
+    # A single user message might lead to an agent turn that calls one LRFT.
+    # We process that before looking for another.
+    current_lr_function_call: Optional[genai_types.FunctionCall] = None
+    # current_lr_function_response stores the *initiator's* response (task_id, etc.)
+    current_lr_function_response: Optional[genai_types.FunctionResponse] = None
+
+    # Initial agent run with the new message
     current_events_stream = runner.run_async(
         session_id=session_id, user_id=user_id, new_message=content
     )
-    response_parts: List[str] = []
-    
-    # Loop to handle initial run and subsequent runs after LRFT responses are injected
-    while True:
-        has_more_events = False
+
+    processing_complete_for_this_turn = False
+    while not processing_complete_for_this_turn:
         async for event in current_events_stream:
-            has_more_events = True # Mark that we received events in this stream
-            # 1. Collect model's textual responses
-            if hasattr(event, "content") and event.content and event.content.role == "model":
-                if hasattr(event.content, "parts") and event.content.parts:
-                    part_text = getattr(event.content.parts[0], "text", None)
-                    if isinstance(part_text, str) and part_text:
-                        # Check if it's one of our LRFT pending messages
-                        if "pending_agent_client_action" not in part_text and \
-                           "Awaiting client polling" not in part_text:
-                            response_parts.append(part_text)
+            if event.content and event.content.parts:
+                for part in event.content.parts:
+                    # 1. Collect model's textual responses
+                    if part.text:
+                        # Suppress pending messages from initiator if desired, or log them
+                        if "pending_agent_client_action" not in part.text and \
+                           "Awaiting client polling" not in part.text:
+                            response_parts.append(part.text)
+                            logger.info(f"AGENT_RUN [{event.author or 'agent'}]: Appended text: \"{part.text[:100]}...\"")
                         else:
-                            logger.info(f"LR_CLIENT: Suppressing LRFT pending message from final output: {part_text}")
+                            logger.info(f"AGENT_RUN [{event.author or 'agent'}]: LRFT pending message: \"{part.text}\"")
+                    
+                    # 2. Detect FunctionCall to our LRFTs
+                    if not current_lr_function_call: # Only look for a new LR call if not already tracking one
+                        fc = get_lr_function_call_if_any(event, managed_lr_tool_names)
+                        if fc:
+                            current_lr_function_call = fc
+                            logger.info(f"AGENT_RUN: Detected call to LRFT '{fc.name}' (ID: {fc.id}). Waiting for initiator's response.")
+                            # Don't break; initiator response might be in the same event or next part.
 
-            # 2. Detect if a LongRunningFunctionTool was called and needs polling
-            await _handle_long_running_tool_event(event, session_id, user_id, runner)
+                    # 3. Get the initiator's FunctionResponse for the detected LRFT call
+                    if current_lr_function_call and not current_lr_function_response:
+                        fr = get_lr_initiator_function_response(event, current_lr_function_call.id)
+                        if fr:
+                            current_lr_function_response = fr
+                            logger.info(f"AGENT_RUN: Received initiator response for LRFT '{current_lr_function_call.name}' (ID: {current_lr_function_call.id}).")
+                            try:
+                                # The initiator function (e.g., initiate_image_generation) returns a dict.
+                                # This dict is placed in fr.response by the ADK.
+                                initiator_output = fr.response # This should be a dict
+                                if not isinstance(initiator_output, dict):
+                                     # Sometimes it might be a string that needs parsing, depending on ADK version or LLM interaction
+                                     if isinstance(initiator_output, str):
+                                         initiator_output = json.loads(initiator_output)
+                                     else:
+                                         raise ValueError(f"Initiator output is not a dict or parsable string: {type(initiator_output)}")
 
-        # 3. After processing all events from the current stream, check if we need to poll
+
+                                task_id = initiator_output.get("task_id")
+                                tool_name = initiator_output.get("tool_name") # Get tool_name from initiator's payload
+
+                                if initiator_output.get("status") == "pending_agent_client_action" and task_id and tool_name:
+                                    logger.info(f"AGENT_RUN: Adding LR task to PENDING_LR_TASKS_FOR_CLIENT_POLLING: task_id={task_id}, tool_name={tool_name}, original_call_id={current_lr_function_call.id}")
+                                    if session_id not in PENDING_LR_TASKS_FOR_CLIENT_POLLING:
+                                        PENDING_LR_TASKS_FOR_CLIENT_POLLING[session_id] = []
+                                    PENDING_LR_TASKS_FOR_CLIENT_POLLING[session_id].append({
+                                        "task_id": task_id,
+                                        "tool_name": tool_name, # Use tool_name from payload
+                                        "original_tool_call_id": current_lr_function_call.id,
+                                        "user_id": user_id
+                                    })
+                                else:
+                                    logger.warning(f"AGENT_RUN: LRFT initiator for '{current_lr_function_call.name}' did not return 'pending_agent_client_action' status or missing task_id/tool_name. Payload: {initiator_output}")
+                            except Exception as e:
+                                logger.error(f"AGENT_RUN: Error processing initiator output for LRFT '{current_lr_function_call.name}': {e}. Response payload: {fr.response}", exc_info=True)
+                            
+                            # Reset for the next potential LRFT call within the same agent turn (if any)
+                            # Though typically one LRFT call means the agent pauses.
+                            current_lr_function_call = None
+                            current_lr_function_response = None
+        
+        # After processing all events from the current stream:
         if session_id in PENDING_LR_TASKS_FOR_CLIENT_POLLING and PENDING_LR_TASKS_FOR_CLIENT_POLLING[session_id]:
+            logger.info(f"AGENT_RUN: Polling for session {session_id} as tasks are pending.")
+            # _poll_and_inject_responses will call runner.run_async internally for injections.
+            # We need a new stream for *after* those injections.
             await _poll_and_inject_responses(session_id, runner)
-            # After injecting, we need to re-run the agent with no new user message
-            # to allow it to process the injected FunctionResponse.
-            # The previous `runner.run_async` inside `_poll_and_inject_responses` already does this.
-            # We need to ensure the main loop continues if there are still pending tasks.
-            # The _poll_and_inject_responses now iterates through runner.run_async for injections.
-            # After it finishes, if there are *still* pending tasks (e.g. one completed, another started), re-loop.
-            # Or, if the agent is now waiting for new user input but some LR tasks are backgrounded.
-            # The agent run will naturally end if it's awaiting user input. The LR tasks are external.
 
-            # Let's refine: the _run_agent_and_get_response should process one "turn".
-            # If that turn results in an LRFT call, PENDING_LR_TASKS_FOR_CLIENT_POLLING gets populated.
-            # The *caller* of _run_agent_and_get_response (e.g. websocket loop) should then manage the polling.
-
-            # For now, let's simplify the polling loop for _run_agent_and_get_response
-            # to handle only tasks initiated IN THIS CURRENT call.
-            # This simplified version will run, detect LR tasks, poll them to completion, then return.
-            # This makes _run_agent_and_get_response a blocking call from the perspective of LR tasks.
-            
-            # Revised loop for _run_agent_and_get_response:
-            # Keep running and polling until PENDING_LR_TASKS_FOR_CLIENT_POLLING for this session is empty.
-            # This means the agent might go through multiple internal "turns" if one LRFT completion
-            # leads to another agent calling another LRFT.
-            
-            # The `_poll_and_inject_responses` function now runs the agent internally.
-            # So, after it runs, we check PENDING_LR_TASKS_FOR_CLIENT_POLLING.
-            # If it's empty, the agent has completed all current LR branches or is awaiting user input.
-            if not (session_id in PENDING_LR_TASKS_FOR_CLIENT_POLLING and PENDING_LR_TASKS_FOR_CLIENT_POLLING[session_id]):
-                break # No more pending tasks for this session that this call initiated/polled.
+            if session_id in PENDING_LR_TASKS_FOR_CLIENT_POLLING and PENDING_LR_TASKS_FOR_CLIENT_POLLING[session_id]:
+                logger.info(f"AGENT_RUN: Tasks still pending for {session_id} after poll cycle. Agent may need more turns or is waiting for these.")
+                # If an agent is designed to make multiple LRFT calls sequentially, or if one LRFT
+                # resolution triggers another, the loop needs to continue.
+                # We create a new stream by calling run_async with no new user message,
+                # allowing the agent to process the injected FunctionResponses.
+                current_events_stream = runner.run_async(
+                    session_id=session_id, user_id=user_id, new_message=None # No new user message
+                )
+                # response_parts = [] # Optionally clear response parts if only accumulating final turn's response
             else:
-                # If there are still pending tasks, it implies the agent hasn't produced its final textual response yet
-                # and is waiting for these other LR tasks. The polling will continue.
-                # We need a new stream from the runner for the next "natural" agent progression if any.
-                # This part is tricky. The `_poll_and_inject_responses` makes new `run_async` calls.
-                # The original `current_events_stream` is exhausted.
-                # For this simplified model, we assume one main user query leads to a set of LR tasks,
-                # they all get polled to completion, and then a final response is gathered.
-                # If an injected FunctionResponse causes the agent to call *another* LRFT,
-                # `_handle_long_running_tool_event` (called inside `_poll_and_inject_responses` indirectly)
-                # would add it to PENDING_LR_TASKS_FOR_CLIENT_POLLING.
-                logger.info(f"LR_CLIENT: Loop continuing in _run_agent_and_get_response as tasks for {session_id} are still pending.")
-                # We need to make sure we are not stuck if an agent is genuinely waiting for new user input
-                # while background tasks are still in PENDING_LR_TASKS_FOR_CLIENT_POLLING (e.g. user initiated 2 things).
-                # This simplified polling here assumes all LR tasks must resolve before this function returns.
+                logger.info(f"AGENT_RUN: All pending tasks for {session_id} resolved in this poll cycle.")
+                # Get the agent's response after all polling and injections for this turn.
+                current_events_stream = runner.run_async(
+                    session_id=session_id, user_id=user_id, new_message=None
+                )
+                # Let the loop run one more time with this new stream to collect final text.
+                # The loop will then break if no new LR tasks are initiated.
+        else:
+            logger.info(f"AGENT_RUN: No pending LR tasks for session {session_id} to poll. Turn complete.")
+            processing_complete_for_this_turn = True # Exit the while loop
 
-                # If `has_more_events` was false from the last stream, and we still have pending tasks,
-                # it means the agent is paused waiting for LR results. The poll will inject.
-                # We need to get a new stream for the agent's reaction to injected results if poll didn't run it.
-                # The `_poll_and_inject_responses` now runs the agent, so this is covered.
-                pass # Loop will continue if PENDING_LR_TASKS_FOR_CLIENT_POLLING is not empty.
-
-        elif not has_more_events and not (session_id in PENDING_LR_TASKS_FOR_CLIENT_POLLING and PENDING_LR_TASKS_FOR_CLIENT_POLLING[session_id]):
-            # No events from the last stream and no pending LR tasks for this session means agent is done for this "turn".
-            break
-        elif not has_more_events and (session_id in PENDING_LR_TASKS_FOR_CLIENT_POLLING and PENDING_LR_TASKS_FOR_CLIENT_POLLING[session_id]):
-            # Agent produced no new events (likely waiting), but we have LR tasks to poll.
-            # The main polling logic in _poll_and_inject_responses will run the agent again after injection.
-            await _poll_and_inject_responses(session_id, runner) # Ensure polling happens
-            if not (session_id in PENDING_LR_TASKS_FOR_CLIENT_POLLING):
-                break
-
-
-    logging.info(f"Agent run finished for session {session_id}. Responses: {len(response_parts)}")
+    logger.info(f"AGENT_RUN: Finished for session {session_id}. Final response parts count: {len(response_parts)}")
     return response_parts
+
+
+
+async def _poll_and_inject_responses(session_id: str, runner: Runner):
+    if session_id not in PENDING_LR_TASKS_FOR_CLIENT_POLLING or not PENDING_LR_TASKS_FOR_CLIENT_POLLING[session_id]:
+        return
+
+    logger.debug(f"POLL_INJECT: Starting poll cycle for session {session_id}. Pending tasks: {len(PENDING_LR_TASKS_FOR_CLIENT_POLLING[session_id])}")
+    tasks_to_re_add = [] # For tasks that are submitted but not yet completed/failed
+    processed_indices_in_this_poll = []
+
+
+    for idx, task_details in enumerate(PENDING_LR_TASKS_FOR_CLIENT_POLLING[session_id]):
+        task_id = task_details["task_id"]
+        tool_name = task_details["tool_name"]
+        original_tool_call_id = task_details["original_tool_call_id"]
+        user_id_for_task = task_details["user_id"]
+
+        task_status_obj = None
+        final_result_payload_str = None # This should be the JSON string
+
+        # Determine which global task list to check
+        if tool_name == "initiate_image_generation": # Match the tool_name from initiator payload
+            task_status_obj = IMAGE_GENERATION_TASKS.get(task_id)
+        elif tool_name == "initiate_video_generation":
+            task_status_obj = VIDEO_GENERATION_TASKS.get(task_id)
+        # Add elif for TTS, STT tasks here, checking their respective global task dicts
+        elif tool_name == "initiate_tts_generation":
+            task_status_obj = TTS_GENERATION_TASKS.get(task_id)
+        elif tool_name == "initiate_stt_transdcription":  
+             task_status_obj = STT_TRANSCRIPTION_TASKS.get(task_id)
+
+
+        if task_status_obj:
+            current_status = task_status_obj.get("status")
+            if current_status in ["completed", "failed"]:
+                logger.info(f"POLL_INJECT: Task {task_id} ({tool_name}) fully completed with status: {current_status}.")
+                if current_status == "completed":
+                    # 'result' from our background task is already a JSON string.
+                    final_result_payload_str = task_status_obj.get("result", '"[]"') # Default to empty JSON list string
+                else: # failed
+                    final_result_payload_str = json.dumps({"error": task_status_obj.get("error", "Unknown error in task")})
+                
+                # The `response` for FunctionResponse must be a dict.
+                # If the LlmAgent that called the LRFT is simple and its instruction is to output the tool's result directly,
+                # and the "result" is the JSON string, we package it as {"result": "json_string_payload"}.
+                # This way, the LlmAgent's output_key will store the raw JSON string.
+                function_response_content_dict = {"result": final_result_payload_str}
+
+                function_response_part = genai_types.Part(
+                    function_response=genai_types.FunctionResponse(
+                        id=original_tool_call_id,
+                        name=tool_name, # Name of the original LRFT initiator tool
+                        response=function_response_content_dict
+                    )
+                )
+                logger.info(f"POLL_INJECT: Injecting FunctionResponse for task {task_id} (call_id: {original_tool_call_id}) into session {session_id}.")
+                
+                # Create a new stream for this injection.
+                # The consumer of _poll_and_inject_responses will then get the next stream.
+                injection_event_stream = runner.run_async(
+                    session_id=session_id,
+                    user_id=user_id_for_task,
+                    new_message=genai_types.Content(parts=[function_response_part], role='tool') # role='tool' is correct for FunctionResponse
+                )
+                async for event in injection_event_stream: # Consume events from this injection run
+                    logger.debug(f"POLL_INJECT: Event from injection run for {task_id}: {event.type}")
+                    # Potentially, this injection run could trigger another LRFT.
+                    # Check for new LRFT calls resulting from this injection.
+                    # This is where it gets recursive if not careful.
+                    # For now, assume injection primarily provides data back.
+                    pass
+
+
+                processed_indices_in_this_poll.append(idx)
+                # Clean up from global tracking dicts
+                if tool_name == "initiate_image_generation" and task_id in IMAGE_GENERATION_TASKS: del IMAGE_GENERATION_TASKS[task_id]
+                elif tool_name == "initiate_video_generation" and task_id in VIDEO_GENERATION_TASKS: del VIDEO_GENERATION_TASKS[task_id]
+                elif tool_name == "initiate_tts_generation" and task_id in TTS_GENERATION_TASKS: del TTS_GENERATION_TASKS[task_id] # NEW
+                elif tool_name == "initiate_stt_transcription" and task_id in STT_TRANSCRIPTION_TASKS: del STT_TRANSCRIPTION_TASKS[task_id] # NEW
+                # Add TTS/STT cleanup here
+
+            elif current_status == "submitted" or current_status == "processing":
+                logger.debug(f"POLL_INJECT: Task {task_id} ({tool_name}) still '{current_status}'. Will poll again later.")
+                # tasks_to_re_add.append(task_details) # No, just leave it in the main list
+            else: # Unknown status
+                logger.warning(f"POLL_INJECT: Task {task_id} ({tool_name}) has unknown status: {current_status}. Removing from polling.")
+                processed_indices_in_this_poll.append(idx)
+
+        else: # Task not found in its tracking dictionary (should not happen if added correctly)
+            logger.warning(f"POLL_INJECT: Task {task_id} ({tool_name}) not found in its tracking dictionary. Removing from polling.")
+            processed_indices_in_this_poll.append(idx)
+    
+    # Remove processed tasks from PENDING_LR_TASKS_FOR_CLIENT_POLLING
+    if processed_indices_in_this_poll:
+        new_pending_list = [
+            item for i, item in enumerate(PENDING_LR_TASKS_FOR_CLIENT_POLLING[session_id])
+            if i not in processed_indices_in_this_poll
+        ]
+        if not new_pending_list:
+            del PENDING_LR_TASKS_FOR_CLIENT_POLLING[session_id]
+            logger.debug(f"POLL_INJECT: All tasks for session {session_id} removed from pending list.")
+        else:
+            PENDING_LR_TASKS_FOR_CLIENT_POLLING[session_id] = new_pending_list
+            logger.debug(f"POLL_INJECT: Session {session_id} now has {len(new_pending_list)} tasks remaining in pending list.")
 
 
 # NEW Helper specifically for the voice query path, ensuring user_id is passed
