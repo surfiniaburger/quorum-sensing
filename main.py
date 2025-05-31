@@ -1410,23 +1410,49 @@ Output ONLY the revised dialogue script. No intros/outros.
         instruction="Tone analyzer. Session: `current_recap`. Analyze from winner/neutral perspective. Output ONLY: 'positive', 'negative', or 'neutral'.",
         output_key="tone_check_result",
     )
-    generated_visual_prompts_agent = LlmAgent( # Was: GeneratedVisualPrompts
-        name="GeneratedVisualPromptsForLR", # New name for clarity
-        model=GEMINI_FLASH_MODEL_ID,
-        instruction="""
-Assistant director analyzing 'current_recap' for Imagen 3 shots (filters names).
-Identify 3-5 key moments/scenes.
-**Imagen Rules:** NO Player/Team Names. Generic uniforms ("player in white home uniform", "batter in colored away jersey", "MLB player's uniform").
-**Prompts:** Actions (HR, DP, K) -> 1-2 prompts. Descriptive moments (stadium) -> 1 prompt. Emphasize action, emotion, setting, generic uniforms.
-Output ONLY JSON list of 3-5 prompt strings (e.g., "[\\"Prompt 1\\", ...]"). "[]" if no moments.
+    generated_visual_prompts_agent = LlmAgent(
+        name="GeneratedVisualPromptsForLR",
+        model=GEMINI_PRO_MODEL_ID, # Using PRO for potentially better/more diverse prompts
+        instruction="""You are an expert visual prompter for an advanced image generation model, tasked with creating prompts for an MLB game recap.
+Your goal is to generate 3-4 vivid, action-oriented, and emotionally resonant image prompts based on the game's 'current_recap' from session state.
+
+**CRITICAL SAFETY & STYLE GUIDELINES (Strict Adherence Required):**
+1.  **NO SPECIFIC NAMES OR LIKENESSES:**
+    *   Absolutely NO real player names (e.g., "Shohei Ohtani," "Aaron Judge").
+    *   Absolutely NO team names (e.g., "Dodgers," "Yankees," "Red Sox," "Brewers").
+    *   Avoid descriptions that could inadvertently generate a recognizable likeness of a real person or specific team logo.
+2.  **GENERIC PLAYER & TEAM DESCRIPTIONS:**
+    *   Refer to players by their roles: "the batter," "the pitcher," "a fielder," "the runner," "the catcher," "a player."
+    *   Describe uniforms generically using primary colors and role: "a player in a dark blue and white home uniform," "the batter in a grey away jersey with red trim," "a pitcher in a pinstriped uniform with a red cap," "team in predominantly blue uniforms."
+    *   If team context is important, use generic terms like "the home team," "the visiting team," "the winning team," "the defensive team."
+3.  **FOCUS ON ACTION, EMOTION, & SCENE:**
+    *   Capture peak actions: "A batter swings powerfully, making solid contact with the baseball." "A fielder dives horizontally, glove outstretched, to make a spectacular catch in the outfield." "A runner slides into home plate just ahead of the tag."
+    *   Convey emotions: "Players from the home team erupt in a joyous celebration on the field after a game-winning play." "A close-up on a pitcher's determined face, eyes focused on the catcher's mitt." "The dejected visiting team walks slowly off the field."
+    *   Describe the scene: "A packed baseball stadium under bright afternoon sun." "Dramatic stadium lights illuminating the field during a night game." "Fans in the stands cheering wildly, blurred in the background."
+4.  **USE DESCRIPTIVE ADJECTIVES & CAMERA ANGLES (Optional but helpful):**
+    *   "Dynamic low-angle shot of..." "Cinematic wide shot of..." "Dramatic close-up of..." "Intense action shot..."
+5.  **PROMPT STRUCTURE:** Each prompt should be a concise, descriptive sentence or two, focusing on a single visual idea.
+
+**TASK:**
+1.  Carefully analyze the 'current_recap' from session state to identify 3-4 distinct, visually compelling key moments or scenes.
+2.  For each identified moment, craft one image prompt following ALL the guidelines above. Ensure each prompt is unique.
+3.  Crucially, **translate any specific player names, team names, or overly specific details from the recap into the generic descriptions outlined in the guidelines.**
+    *   *Example Recap Snippet:* "Sal Frelick of the Brewers hit a walk-off single in the 9th, and the Brewers mobbed him."
+    *   *Corresponding Generic Prompt Example 1:* "A batter in a navy blue and gold home uniform hits a sharp ground ball into the outfield for a game-winning single, as teammates in similar uniforms rush from the dugout to celebrate near home plate under stadium lights."
+    *   *Corresponding Generic Prompt Example 2:* "Dynamic shot of players in dark blue uniforms piling on a teammate in celebration after a dramatic walk-off victory at night."
+
+Output ONLY a JSON list of these 3-4 generated prompt strings.
+Example JSON output: `["A batter in a red and white uniform swings powerfully, connecting with the pitch, sending it high.", "A fielder in a grey uniform lays out for a diving catch on the outfield grass, dust kicking up.", "The winning team's players, in vibrant blue jerseys, pour out of the dugout in a jubilant celebration around home plate."]`
+If no suitable visual moments can be extracted that adhere to these guidelines, or if the recap is too short/vague, output an empty JSON list: `"[]"`.
+Do not include any preamble or explanation outside the JSON list.
         """,
-        output_key="visual_generation_prompts_json", # This key holds the prompts List[str] for the LR tool
+        output_key="visual_generation_prompts_json"
     )
 
     # 2. Agent to call the LongRunningFunctionTool for Image Generation
     image_generation_lr_tool_caller_agent = LlmAgent(
         name="ImageGenerationLRToolCaller",
-        model=GEMINI_FLASH_MODEL_ID, # Simple model to just make a tool call
+        model=GEMINI_FLASH_MODEL_ID,
         instruction="""
 You are a dispatcher. Your task is to initiate an image generation job.
 Read the list of image prompts from session state key 'visual_generation_prompts_json'.
@@ -1435,48 +1461,23 @@ You MUST call the 'initiate_image_generation' tool with these prompts and the ga
 Your entire job is to make this single tool call. Do not respond with text.
 The tool will return a task ID and status. This will be your output.
         """,
-        tools=[long_running_image_tool], # Pass the ADK LongRunningFunctionTool
-        output_key="final_image_uris_from_lr_tool_json_string" # Will contain {"status": "pending_agent_client_action", "task_id": ...}
+        tools=[long_running_image_tool],
+        output_key="final_image_uris_from_lr_tool_json_string" # CORRECTED/VERIFIED
+    )
+    logger.info(f"DEBUG: ImageGenerationLRToolCaller.output_key = {image_generation_lr_tool_caller_agent.output_key}")
+
+
+    image_final_result_processor_instruction = """You are a data processor.
+Read image URIs from session state '{final_image_uris_from_lr_tool_json_string}'.
+Format them into 'all_generated_image_assets_details' and 'assets_for_critique_json'.
+Output: 'Image results processed.'"""
+    logger.info(f"DEBUG: ImageFinalResultProcessor instruction template: {image_final_result_processor_instruction}")
+    image_final_result_processor = LlmAgent(
+        name="ImageFinalResultProcessor", model=GEMINI_FLASH_MODEL_ID,
+        instruction=image_final_result_processor_instruction, # Uses the string with correct placeholder
+        output_key="image_final_result_processing_status"
     )
 
-    # Create the sequential agent for one pass of image generation initiation and result collection
-    image_result_processor_agent = LlmAgent( # Can be an LlmAgent if it just needs to parse and set state
-        name="ImageResultProcessorFromLR",
-        model=GEMINI_FLASH_MODEL_ID, # Or even a BaseAgent if no LLM needed
-        instruction="""
-You are a data processor. You will receive a JSON string in session state key '{lr_image_tool_final_output}'.
-This string contains a list of image URIs or an error from an image generation tool.
-Parse this JSON string.
-If it's a list of URIs, create a new list of asset detail objects: `[{"image_uri": "uri1", "type": "generated_image_lr", "prompt_origin":"unknown_for_now"}, ...]`
-Store this list of asset detail objects in session state key 'all_generated_image_assets_details'.
-Also, prepare a JSON string for 'assets_for_critique_json' using these URIs and dummy prompts (e.g., `[{"prompt_origin": "Prompt for URI1", "image_uri": "uri1"}, ...]`).
-If the input JSON string indicates an error, or is not a list, set 'all_generated_image_assets_details' to `[]` and 'assets_for_critique_json' to `"[]"`.
-Output a brief status message like "Processed N image URIs." or "Image generation failed."
-        """,
-        # This agent needs to know the output_key of `image_generation_lr_tool_caller_agent`
-        # Let's assume `image_generation_lr_tool_caller_agent.output_key` is "lr_image_tool_final_output"
-        # This is injected via placeholder in instruction.
-        # This LlmAgent approach is a bit forced for simple data manipulation. A BaseAgent would be cleaner.
-        output_key="image_result_processing_status"
-    )
-# final_image_uris_from_lr_tool_json_string
-
-    iterative_image_generation_pipeline_components = [
-        generated_visual_prompts_agent, # Generates prompts into `visual_generation_prompts_json`
-        image_generation_lr_tool_caller_agent, # Calls LRFT, result (after client poll) in `image_generation_lr_task_submission_details` (actually its output_key)
-        # At this point, the main runner loop polls and injects FunctionResponse.
-        # The `image_generation_lr_tool_caller_agent` then completes and writes to its output_key.
-        # We need to use THAT output_key as input for the next agent.
-        # Let's say image_generation_lr_tool_caller_agent.output_key = "final_image_uris_from_lr_tool_json_string"
-    ]
-    # The critique part will be added after this sequence, consuming `all_generated_image_assets_details`
-    # which `image_result_processor_agent` would set.
-
-    # For now, `iterative_image_generation_agent_instance` is simplified to just initiate.
-    # The full iterative loop with LR tools requires more advanced orchestration.
-    # Let's define the agent that *will* be used in the ParallelAssetPipelinesAgent
-    # This will be a sequence that does: GenPrompts -> CallLRFT
-    # The result processing and critique must happen *after* the ParallelAgent completes its branches.
     image_generation_initiation_sequence = SequentialAgent(
         name="ImageGenerationInitiationSequence",
         sub_agents=[
@@ -1488,28 +1489,26 @@ Output a brief status message like "Processed N image URIs." or "Image generatio
     # The output of `image_generation_lr_tool_caller_agent` (task details / final URIs after polling)
     # will be used by later agents in the main GameRecapAgentV2 sequence.  IterativeImageGeneration
 
-    # == VIDEO GENERATION REVISED ==
-    # 1. Agent to generate prompts (same as before)
-    veo_prompt_generator_agent = LlmAgent( # Was: VeoPromptGenerator
-        name="VeoPromptGeneratorForLR", # New name
-        model=GEMINI_PRO_MODEL_ID,
+    # === VIDEO AGENTS ===
+    veo_prompt_generator_agent = LlmAgent(
+        name="VeoPromptGeneratorForLR",
+        model=GEMINI_PRO_MODEL_ID, # Using PRO for potentially better/more diverse prompts
         instruction="""
 Creative video director for MLB Veo clips (5-8s). Prompts MUST be safe.
 Session: 'current_recap', 'visual_critique_text' (Optional from image phase), 'all_image_assets_list' (Optional), 'all_video_assets_list' (Optional).
-1.  **Review 'current_recap'**: ID 2-3 key moments for short clips (pitch/swing, dive, slide, reaction, fan celebration). Avoid complex sequences.
+1.  **Review 'current_recap'**: ID 1-2 key moments for short clips (pitch/swing, dive, slide, reaction, fan celebration). Avoid complex sequences.
 2.  **Consider Existing Visuals**: Review 'all_image_assets_list', 'all_video_assets_list'. Avoid duplication unless video adds unique dynamism. Complement, don't repeat.
-3.  **Veo Prompts (1-2, max 3 if distinct & safe):**
+3.  **Veo Prompts (1-2, max 2 if distinct & safe):**
     *   **Safety First:** Adhere to content guidelines. Factual descriptions. AVOID aggressive/violent words (e.g., "batter hits long fly ball" not "crushes"). Focus athleticism.
     *   **Clarity:** One primary subject/action.
     *   **Conciseness:** Scene for 5-8s.
     *   **Dynamic but Safe Language:** Motion, camera work ("slow-motion of...", "dynamic low-angle...").
     *   **Naming Rules (Strict):** NO player/team names. Generic: "MLB player", "home team batter".
-Output ONLY JSON list of 1-2 (max 3) Veo prompt strings. `"[]"` if no suitable moments. Example: `["Slow-motion of baseball hitting bat.", "Dynamic shot of player sliding."]`
+Output ONLY JSON list of 1-2 Veo prompt strings. `"[]"` if no suitable moments. Example: `["Slow-motion of baseball hitting bat.", "Dynamic shot of player sliding."]`
         """,
-        output_key="veo_generation_prompts_json", # This key holds the prompts List[str] for the LR tool
+        output_key="veo_generation_prompts_json"
     )
 
-    # 2. Agent to call the LongRunningFunctionTool for Video Generation
     video_generation_lr_tool_caller_agent = LlmAgent(
         name="VideoGenerationLRToolCaller",
         model=GEMINI_FLASH_MODEL_ID,
@@ -1522,7 +1521,19 @@ Your entire job is to make this single tool call. Do not respond with text.
 The tool will return a task ID and status. This will be your output.
         """,
         tools=[long_running_video_tool],
-        output_key="final_video_uris_from_lr_tool_json_string"
+        output_key="final_video_uris_from_lr_tool_json_string" # CORRECTED/VERIFIED
+    )
+    logger.info(f"DEBUG: VideoGenerationLRToolCaller.output_key = {video_generation_lr_tool_caller_agent.output_key}")
+
+    video_final_result_processor_instruction = """You are a data processor.
+Read video URIs from session state '{final_video_uris_from_lr_tool_json_string}'.
+Format them into 'final_video_assets_list'.
+Output: 'Video results processed.'"""
+    logger.info(f"DEBUG: VideoFinalResultProcessor instruction template: {video_final_result_processor_instruction}")
+    video_final_result_processor = LlmAgent(
+        name="VideoFinalResultProcessor", model=GEMINI_FLASH_MODEL_ID,
+        instruction=video_final_result_processor_instruction, # Uses the string with correct placeholder
+        output_key="video_final_result_processing_status"
     )
 
     video_generation_initiation_sequence = SequentialAgent(
@@ -1533,7 +1544,6 @@ The tool will return a task ID and status. This will be your output.
         ],
         description="Generates prompts and initiates long-running video generation."
     )
-
 
     # Asset-related LlmAgents (copied)
     entity_extractor_agent = LlmAgent(
@@ -1546,58 +1556,7 @@ The tool will return a task ID and status. This will be your output.
         instruction="""Parse 'extracted_entities_json'. For each team, query "[Team Name] logo". For each player, query "[Player Name] headshot". Output JSON list of these query strings. "[]" if no entities. ONLY JSON string.""",
         output_key="static_asset_search_queries_json",
     )
-    logo_searcher_llm_agent = LlmAgent(
-        name="LogoSearcherLlm", model=GEMINI_PRO_MODEL_ID,
-        instruction="""
-Your ONLY GOAL is to call the `image_embedding_mcp.search_similar_images_by_text` tool EXACTLY ONCE and output its RAW JSON string result.
 
-STATE INPUT: `session.state.team_name_for_logo_search`
-
-STEPS:
-1. Check if `session.state.team_name_for_logo_search` is present and not empty.
-2. IF EMPTY OR MISSING: Your output MUST be the exact JSON string: `"[]"`. DO NOTHING ELSE.
-3. IF PRESENT: Call `image_embedding_mcp.search_similar_images_by_text` ONCE with parameters:
-    - `query_text`: value from `session.state.team_name_for_logo_search`
-    - `top_k`: 1
-    - `filter_image_type`: "logo"
-4. The tool will return a JSON string.
-5. Your FINAL and ONLY output MUST be this exact JSON string from the tool.
-DO NOT add "Okay". DO NOT add "Here it is". DO NOT GREET. DO NOT SUMMARIZE. DO NOT ASK QUESTIONS. Output ONLY the JSON string.
-""",
-        tools=loaded_mcp_tools_global.get("image_embedding_mcp", []),
-        output_key="logo_search_result_json",
-    )
-    headshot_retriever_llm_agent = LlmAgent(
-        name="HeadshotRetrieverLlm", model=GEMINI_PRO_MODEL_ID,
-        instruction="""
-You are a robot with a single, precise function.
-1.  You will be given `player_id_for_headshot_search` and `player_name_for_headshot_log` in session state.
-2.  You MUST call the tool `static_retriever_mcp.get_headshot_uri_if_exists` EXACTLY ONCE.
-3.  Use these exact parameters for the tool call:
-    - `player_id_str`: {session.state.player_id_for_headshot_search}
-    - `player_name_for_log`: {session.state.player_name_for_headshot_log}
-4.  The tool will return a JSON string. This JSON string is your ONLY output.
-5.  Your entire response for this step MUST be the direct, verbatim JSON string that is returned by the tool.
-6.  DO NOT add any other text, explanation, formatting, markdown, or conversational remarks.
-7.  If `session.state.player_id_for_headshot_search` is missing or empty, your output should be the JSON string "{}" (an empty object). DO NOT call the tool in this case.
-""",
-        tools=loaded_mcp_tools_global.get("static_retriever_mcp", []),
-        output_key="headshot_uri_result_json",
-    )
-
-
-    visual_generator_mcp_caller_agent = LlmAgent(
-        name="VisualGeneratorMCPCaller", model=GEMINI_FLASH_MODEL_ID, # Changed from PRO
-        instruction="""
-Image gen coordinator.
-1.  Inputs: `session.state.visual_generation_prompts_json_for_tool` (JSON string list), `session.state.game_pk_str_for_tool`. If prompts invalid/empty, output `"[]"` ONLY, no tool call.
-2.  Tool: Call `visual_assets.generate_images_from_prompts` with `prompts_json`=input prompts string, `game_pk_str`=input game_pk string.
-3.  Output (CRITICAL): Tool responds like `{"name":"...", "response":{"result":{"content":[{"text":"[\\"gs://uri1\\",...]"}]}}}`. Extract inner `"text"` value.
-    Final output MUST be ONLY this extracted JSON string (e.g., `"[\\"gs://uri1\\", ...]"`) or tool's error JSON (e.g., `"{\\"error\\":...}"`). No other text.
-        """,
-        tools=loaded_mcp_tools_global.get("visual_assets", []),
-        output_key="generated_visual_assets_uris_json",
-    )
     visual_critic_agent = LlmAgent(
         name="VisualCritic", model=GEMINI_FLASH_MODEL_ID, # Changed from PRO
         instruction="""
@@ -1623,67 +1582,6 @@ Output ONLY JSON list string. Example: "[\\"Dynamic shot of fielders turning dou
         output_key="new_visual_generation_prompts_json",
     )
 
-    video_generator_mcp_caller_agent = LlmAgent(
-        name="VideoGeneratorMCPCaller", model=GEMINI_PRO_MODEL_ID,
-        instruction="""
-You are a highly specialized, non-conversational robot. Your SOLE AND ONLY function is to manage a SINGLE tool call to `video_clip_generator_mcp.generate_video_clips_from_prompts` and then IMMEDIATELY output its raw JSON string result. You have NO OTHER CAPABILITIES OR TASKS.
-
-Follow these steps EXACTLY and in this order. DEVIATION IS NOT PERMITTED:
-
-1.  **Retrieve Inputs from Session State:**
-    *   Get the JSON string from session state key `veo_generation_prompts_json_for_tool`.
-    *   Get the string from session state key `game_pk_str_for_tool`.
-
-2.  **Input Validation & Preparation:**
-    *   Attempt to parse the string from `veo_generation_prompts_json_for_tool` into a list of prompt strings. Let this be `parsed_prompt_list`.
-    *   Let the string from `game_pk_str_for_tool` be `game_pk_value`.
-
-3.  **Conditional Tool Call (Perform ONCE or NOT AT ALL):**
-    *   IF `parsed_prompt_list` is empty, or if it's not a list after parsing, or if `veo_generation_prompts_json_for_tool` was initially missing/empty:
-        *   Your ONLY output for this entire interaction MUST be the exact JSON string: `"[]"`
-        *   DO NOT call any tool. YOUR TASK ENDS HERE.
-    *   ELSE (if `parsed_prompt_list` is valid and contains prompts):
-        *   You MUST call the tool `video_clip_generator_mcp.generate_video_clips_from_prompts` EXACTLY ONE TIME.
-        *   Use the `parsed_prompt_list` (the actual Python list of strings) as the value for the tool's `prompts` parameter.
-        *   Use `game_pk_value` as the value for the tool's `game_pk_str` parameter.
-
-4.  **Output Generation (CRITICAL - Precise Echo):**
-    *   The `video_clip_generator_mcp.generate_video_clips_from_prompts` tool will return a JSON string to you (this string will represent either a list of GCS URIs for generated videos or an error object from the tool).
-    *   Your entire and final output for this entire interaction MUST be ONLY this direct, verbatim JSON string that was returned by the tool from that single call.
-    *   DO NOT analyze, modify, reformat, or add any text, markdown, explanations, or conversational remarks before or after this JSON string.
-    *   DO NOT call the tool `video_clip_generator_mcp.generate_video_clips_from_prompts` more than once under any circumstances.
-    *   Your task is COMPLETE once you have outputted the tool's raw JSON string response from the single call.
-
-Example of your required output if tool is called and succeeds: `["gs://video1.mp4", "gs://video2.mp4"]` (as a JSON string)
-Example of your required output if tool is called and tool itself returns an error: `{"error": "tool specific error details"}` (as a JSON string)
-Example of your required output if initial prompts are invalid/empty (Step 3.IF condition): `"[]"` (as a JSON string)
-        """,
-        tools=loaded_mcp_tools_global.get("video_clip_generator_mcp", []),
-        output_key="generated_video_clips_uris_json",
-    )
-    dialogue_to_speech_llm_for_audio = LlmAgent(
-        name="DialogueToSpeechLlmForGameRecap", model=GEMINI_PRO_MODEL_ID, # Using PRO for potentially complex scripts
-        instruction="""
-Audio synthesis robot. SOLE RESPONSIBILITY: generate speech via tool.
-IMMEDIATELY call `audio_processing_mcp.synthesize_multi_speaker_speech`.
-Params: `script`={session.state.current_recap}, `game_pk_str`={session.state.game_pk}.
-Output MUST BE tool's direct, verbatim JSON string (e.g., `{"audio_uri": "gs://..."}` or `{"error": "..."}`). No other text.
-        """,
-        tools=loaded_mcp_tools_global.get("audio_processing_mcp", []),
-        output_key="generated_dialogue_audio_details_json",
-    )
-    audio_to_timestamps_llm_for_audio = LlmAgent(
-        name="AudioToTimestampsLlmForGameRecap", model=GEMINI_PRO_MODEL_ID,
-        instruction="""
-Audio transcription robot. ONLY manage tool call & return specific string.
-1.  Input: `session.state.generated_dialogue_audio_uri`. If missing/invalid (not gs://), output `{"error": "Invalid audio GCS URI."}` ONLY, no tool call.
-2.  Tool: Call `audio_processing_mcp.get_word_timestamps_from_audio` with `audio_gcs_uri`=input URI.
-3.  Output (CRITICAL): Tool responds `{"name":"...", "response":{"result":{"content":[{"text":"[{\"word\": ...}]"}]}}}`. Extract inner `"text"` value.
-    Final output MUST be ONLY this extracted JSON string (e.g., `"[{\"word\": ...}]"`) or tool's error JSON. No other text.
-        """,
-        tools=loaded_mcp_tools_global.get("audio_processing_mcp", []),
-        output_key="word_timestamps_json",
-    )
 
     # --- Define Tools for Graph Generation ---
     game_plotter_tools = loaded_mcp_tools.get("game_plotter_tool", [])
@@ -1795,53 +1693,6 @@ Output ONLY the JSON string list.
         default_output_on_error='{}' # Expects a JSON object string
     )
 
-    # 1. For Visual Generation (replaces VisualGeneratorMCPCaller LlmAgent)
-    direct_visual_generator_agent = DirectToolCallerBaseAgent(
-        name="DirectVisualGenerator",
-        tool_name_to_call="visual_assets.generate_images_from_prompts", # From your visual_asset_server.py
-        input_state_keys={ # Tool arg name : session state key
-            "prompts": "visual_generation_prompts_json_for_tool", # This state key is set by GeneratedVisualPrompts agent
-            "game_pk_str": "game_pk_str_for_tool"      # This state key is set by IterativeImageGenerationAgent
-        },
-        output_state_key="generated_visual_assets_uris_json", # IterativeImageGenerationAgent reads this
-        default_output_on_error='"[]"' # Expects JSON string of a list
-    )
-
-# GeneratedVisualPromptsForLR
-
-    # 2. For Video Generation (replaces VideoGeneratorMCPCaller LlmAgent)
-    direct_video_generator_agent = DirectToolCallerBaseAgent(
-        name="DirectVideoGenerator",
-        tool_name_to_call="video_clip_generator_mcp.generate_video_clips_from_prompts", # From your video_clip_server.py
-        input_state_keys={
-            "prompts": "veo_generation_prompts_json_for_tool", # Set by VeoPromptGenerator agent
-            "game_pk_str": "game_pk_str_for_tool"      # Set by VideoPipelineAgent before this call
-        },
-        output_state_key="generated_video_clips_uris_json", # VideoPipelineAgent reads this
-        default_output_on_error='"[]"'
-    )
-    # 5. For TTS (replaces DialogueToSpeechLlmForGameRecap LlmAgent)
-    direct_tts_agent = DirectToolCallerBaseAgent(
-        name="DirectTTSGenerator",
-        tool_name_to_call="audio_processing_mcp.synthesize_multi_speaker_speech",
-        input_state_keys={
-            "script": "current_recap", # Assuming current_recap is the final script text
-            "game_pk_str": "game_pk"   # Assuming game_pk state holds the string ID or number
-        },
-        output_state_key="generated_dialogue_audio_details_json", # TextToSpeechAgent (BaseAgent wrapper) reads this
-        default_output_on_error='{}'
-    )
-
-    # 6. For STT (replaces AudioToTimestampsLlmForGameRecap LlmAgent)
-    direct_stt_agent = DirectToolCallerBaseAgent(
-        name="DirectSTTGenerator",
-        tool_name_to_call="audio_processing_mcp.get_word_timestamps_from_audio",
-        input_state_keys={
-            "audio_gcs_uri": "generated_dialogue_audio_uri" # Set by TextToSpeechPipeline/DirectTTSGenerator
-        },
-        output_state_key="word_timestamps_json", # SpeechToTimestampsAgent (BaseAgent wrapper) reads this
-        default_output_on_error='"[]"'
-    )
 
     graph_generation_pipeline_agent_instance = SequentialAgent(
         name="GraphGenerationPipeline",
@@ -1852,22 +1703,68 @@ Output ONLY the JSON string list.
         description="Selects appropriate metrics and generates graph images for the game."
     )
 
-    # StaticAssetPipelineAgent, TextToSpeechAgent, SpeechToTimestampsAgent, GraphGenerationPipeline remain the same
-    # as they don't use DirectToolCallerBaseAgent internally for their primary function or are already LlmAgents/custom.
-    # The `logo_searcher_llm` and `headshot_retriever_llm` inside `StaticAssetPipelineAgent`
-    # were LlmAgents, not DirectToolCallerBaseAgent.
-    # Checking: `logo_searcher_llm_agent` and `headshot_retriever_llm_agent` were indeed LlmAgents in your original code.
-    # If they were `DirectToolCallerBaseAgent`, they'd need similar refactoring, but they were not.
+ 
 
-    # The agents `direct_logo_searcher_agent`, `direct_headshot_retriever_agent`,
-    # `direct_visual_generator_agent`, `direct_video_generator_agent`, `direct_tts_agent`, `direct_stt_agent`
-    # were all instances of `DirectToolCallerBaseAgent` and are being replaced or their callers are.
-    # `visual_generator_mcp_caller` was used by `IterativeImageGenerationAgent` -> replaced by `image_generation_lr_tool_caller_agent`.
-    # `video_generator_mcp_caller` was used by `VideoPipelineAgent` -> replaced by `video_generation_lr_tool_caller_agent`.
+    # === TTS AGENTS ===
+    tts_lr_tool_caller_agent = LlmAgent(
+        name="TTSLRToolCaller", model=GEMINI_FLASH_MODEL_ID,
+        instruction="""
+You are a dispatcher.
+Your primary task is to use the 'initiate_tts_generation' tool.
+You will be given the 'script' and 'game_pk_str' in session state.
+Call 'initiate_tts_generation' with these inputs.
+If the tool call to 'initiate_tts_generation' is successful and provides its output (which will be the final audio details as a JSON string after long-running processing is complete),
+your entire response for this interaction MUST BE that exact JSON string provided by the 'initiate_tts_generation' tool.
+Do not add any other commentary.
+If the tool initially returns a pending status, that is fine; the system will handle polling. Your final output should be the tool's final resolved output.
 
-    # Update `StaticAssetPipelineAgent` to ensure its sub-agents are LlmAgents as previously defined,
-    # not the `DirectToolCallerBaseAgent` versions that were placeholders for MCP replacement.
-    # The `logo_searcher_llm_agent` and `headshot_retriever_llm_agent` should be the LlmAgent versions provided earlier.
+""",
+        tools=[long_running_tts_tool],
+        output_key="final_tts_output_json_string" # CORRECTED/VERIFIED
+    )
+    logger.info(f"DEBUG: TTSLRToolCaller.output_key = {tts_lr_tool_caller_agent.output_key}")
+
+
+    tts_final_result_processor_instruction = """You are a data processor.
+The TTS generation tool has completed. Its output (a JSON string with 'audio_uri' or 'error')
+is in session state key '{final_tts_output_json_string}'.
+Parse this JSON string. If successful and an 'audio_uri' is present,
+store this URI in session state key 'generated_dialogue_audio_uri'.
+If there was an error or no URI, log it and ensure 'generated_dialogue_audio_uri' is None.
+Output: 'TTS result processed, audio URI set.' or 'TTS processing failed.'"""
+    logger.info(f"DEBUG: TTSFinalResultProcessor instruction template: {tts_final_result_processor_instruction}")
+    tts_final_result_processor = LlmAgent(
+        name="TTSFinalResultProcessor", model=GEMINI_FLASH_MODEL_ID,
+        instruction=tts_final_result_processor_instruction, # Uses the string with correct placeholder
+        output_key="tts_final_result_processing_status"
+    )
+
+    # === STT AGENTS ===
+    stt_lr_tool_caller_agent = LlmAgent(
+        name="STTLRToolCaller", model=GEMINI_FLASH_MODEL_ID,
+        instruction="""Audio transcription robot.
+Read the generated audio GCS URI from session state key 'generated_dialogue_audio_uri'.
+If the URI is present, you MUST call the 'initiate_stt_transcription' tool with the audio_gcs_uri.
+If no URI is present, output 'Skipping STT as no audio URI found.'
+Your tool call output will be the initial response from the tool (task details).""",
+        tools=[long_running_stt_tool],
+        output_key="final_stt_output_json_string" # CORRECTED/VERIFIED
+    )
+    logger.info(f"DEBUG: STTLRToolCaller.output_key = {stt_lr_tool_caller_agent.output_key}")
+
+    stt_final_result_processor_instruction = """You are a data processor.
+The STT transcription tool has completed. Its output (a JSON string list of word timestamps or an error)
+is in session state key '{final_stt_output_json_string}'.
+Parse this JSON string. If successful, store the list of timestamps in session state key 'word_timestamps_list'.
+If there was an error, ensure 'word_timestamps_list' is empty.
+Output: 'STT result processed, timestamps stored.' or 'STT processing failed.'"""
+    logger.info(f"DEBUG: STTFinalResultProcessor instruction template: {stt_final_result_processor_instruction}")
+    stt_final_result_processor = LlmAgent(
+        name="STTFinalResultProcessor", model=GEMINI_FLASH_MODEL_ID,
+        instruction=stt_final_result_processor_instruction, # Uses the string with correct placeholder
+        output_key="stt_final_result_processing_status"
+    )
+
 
     # --- Instantiate Custom Phase Agents (BaseAgent subclasses) ---
     static_asset_pipeline_agent_instance = StaticAssetPipelineAgent(
@@ -1878,15 +1775,6 @@ Output ONLY the JSON string list.
         headshot_retriever_llm=direct_headshot_retriever_agent # This MUST be the LlmAgent version
     )
 
-
-    text_to_speech_agent_instance = TextToSpeechAgent( # This is your BaseAgent wrapper
-        name="TextToSpeechPipeline",
-        dialogue_to_speech_llm_agent=direct_tts_agent 
-    )
-    speech_to_timestamps_agent_instance = SpeechToTimestampsAgent( # This is your BaseAgent wrapper
-        name="SpeechToTimestampsPipeline",
-        audio_to_timestamps_llm_agent=direct_stt_agent #
-    )
 
     # --- Define Workflow Agents for GameRecapAgentV2 ---
 
@@ -1915,144 +1803,12 @@ Output ONLY the JSON string list.
         description="Generates, refines, and post-processes the game recap script. Primary output to state: 'current_recap'."
     )
 
-    # 2. Audio Processing Pipeline (Sequential - TTS then STT)
-    #    This will be one of the parallel branches.
-    audio_processing_pipeline_for_parallel_instance = SequentialAgent(
-        name="AudioProcessingPipelineForParallel", # Distinct name
-        sub_agents=[
-            text_to_speech_agent_instance,        # Reads 'current_recap', Output: 'generated_dialogue_audio_uri'
-            speech_to_timestamps_agent_instance   # Reads 'generated_dialogue_audio_uri', Output: 'word_timestamps_list'
-        ],
-        description="Generates dialogue audio and then corresponding word timestamps."
-    )
-
-
-    # The GameRecapAgentV2 sequence needs to be adjusted:
-    # 1. Script Generation
-    # 2. Parallel Asset Initiation (the ParallelAgent above)
-    # --- AT THIS POINT, THE AGENT CLIENT POLLING LOGIC IN main.py RUNS for all initiated LR tasks ---
-    # 3. Result Processing and further dependent tasks:
-    #    - Process Image LR results, then Critique & New Prompts (if desired in a loop)
-    #    - Process Video LR results
-    #    - Process TTS LR results, then Initiate STT LR task
-    #    - (Client polls for STT LR task)
-    #    - Process STT LR results
-    # 4. AssetValidationAndRetryAgent (needs to be aware of the new state keys from LR tools)
-    # 5. AssetAggregatorAgent
-
-    # This makes GameRecapAgentV2 a more complex CustomAgent to manage these states and re-entrancy.
-    # For this refactor, I will focus on getting the LR tools initiated and the client polling logic.
-    # The subsequent processing will assume results are populated in state by the client handling.
-
-    # Simplified sequence for GameRecapAgentV2 for this refactor:
-    # Define placeholder "ResultProcessing" agents that would run after client polling.
-    # These would read from state keys like "final_image_uris_from_lr_tool_json_string"
-    # (which is the output_key of the LlmAgent that called the LRFT, after client injected FunctionResponse).
-
-    image_final_result_processor = LlmAgent(
-        name="ImageFinalResultProcessor", model=GEMINI_FLASH_MODEL_ID,
-        instruction="""You are a data processor.
-Read image URIs from session state '{image_generation_lr_tool_caller_agent_output_key}'.
-Format them into 'all_generated_image_assets_details' and 'assets_for_critique_json'.
-Output: 'Image results processed.'""",
-        # Placeholder for actual state key name.
-        output_key="image_final_result_processing_status"
-    )
-    video_final_result_processor = LlmAgent(
-        name="VideoFinalResultProcessor", model=GEMINI_FLASH_MODEL_ID,
-        instruction="""You are a data processor.
-Read video URIs from session state '{video_generation_lr_tool_caller_agent_output_key}'.
-Format them into 'final_video_assets_list'.
-Output: 'Video results processed.'""",
-        output_key="video_final_result_processing_status"
-    )
-  # == TTS REVISED (using LRFT) ==
-    tts_lr_tool_caller_agent = LlmAgent(
-        name="TTSLRToolCaller", model=GEMINI_FLASH_MODEL_ID,
-        instruction="""Audio synthesis robot.
-Read current recap from session state key 'current_recap'.
-Read game PK from session state key 'game_pk'.
-You MUST call the 'initiate_tts_generation' tool with the script and game_pk_str.
-Your output will be the initial response from the tool (task details).""",
-        tools=[long_running_tts_tool],
-        output_key="tts_lr_task_submission_details" # Stores the initial {"status": "pending...", "task_id": ...}
-    )
-
-    # This agent is part of the main sequence AFTER client polling resolves the TTS task.
-    tts_final_result_processor = LlmAgent(
-        name="TTSFinalResultProcessor", model=GEMINI_FLASH_MODEL_ID,
-        instruction="""You are a data processor.
-The TTS generation tool has completed. Its output (a JSON string with 'audio_uri' or 'error')
-is in session state key '{tts_lr_task_submission_details_resolved_output_key}'.
-Parse this JSON string. If successful and an 'audio_uri' is present,
-store this URI in session state key 'generated_dialogue_audio_uri'.
-If there was an error or no URI, log it and ensure 'generated_dialogue_audio_uri' is None or reflects the error.
-Output: 'TTS result processed, audio URI set.' or 'TTS processing failed.'""",
-        # The input state key needs to be the output_key of tts_lr_tool_caller_agent
-        # AFTER it has processed the injected FunctionResponse.
-        # Let's rename tts_lr_tool_caller_agent.output_key to:
-        # output_key="final_tts_details_from_lr_tool_json_string"
-        # And update the instruction to use this.
-        output_key="tts_final_result_processing_status"
-    )
-    # Modify tts_lr_tool_caller_agent.output_key:
-    # tts_lr_tool_caller_agent.output_key = "final_tts_details_from_lr_tool_json_string"
-    # And the instruction for tts_final_result_processor should use this new key.
-    # This change would be:
-    # instruction="...is in session state key 'final_tts_details_from_lr_tool_json_string'..."
-
-
-    # == STT REVISED (using LRFT) ==
-    stt_lr_tool_caller_agent = LlmAgent(
-        name="STTLRToolCaller", model=GEMINI_FLASH_MODEL_ID,
-        instruction="""Audio transcription robot.
-Read the generated audio GCS URI from session state key 'generated_dialogue_audio_uri'.
-If the URI is present, you MUST call the 'initiate_stt_transcription' tool with the audio_gcs_uri.
-If no URI is present, output 'Skipping STT as no audio URI found.'
-Your tool call output will be the initial response from the tool (task details).""",
-        tools=[long_running_stt_tool],
-        output_key="stt_lr_task_submission_details" # Stores initial {"status": "pending...", "task_id": ...}
-    )
-
-    stt_final_result_processor = LlmAgent(
-        name="STTFinalResultProcessor", model=GEMINI_FLASH_MODEL_ID,
-        instruction="""You are a data processor.
-The STT transcription tool has completed. Its output (a JSON string list of word timestamps or an error)
-is in session state key '{stt_lr_task_submission_details_resolved_output_key}'.
-Parse this JSON string. If successful, store the list of timestamps in session state key 'word_timestamps_list'.
-If there was an error, ensure 'word_timestamps_list' is empty or reflects the error.
-Output: 'STT result processed, timestamps stored.' or 'STT processing failed.'""",
-        # Similar to TTS, the input key here should be stt_lr_tool_caller_agent.output_key
-        # after it processes the injected FunctionResponse. Let's call it:
-        # "final_stt_timestamps_from_lr_tool_json_string"
-        output_key="stt_final_result_processing_status"
-    )
-
-    # Update LlmAgent output keys for clarity when they are resolved by LRFT
-    image_generation_lr_tool_caller_agent.output_key = "final_image_uris_from_lr_tool_json_string"
-    video_generation_lr_tool_caller_agent.output_key = "final_video_uris_from_lr_tool_json_string"
-    tts_lr_tool_caller_agent.output_key = "final_tts_details_from_lr_tool_json_string"
-    stt_lr_tool_caller_agent.output_key = "final_stt_timestamps_from_lr_tool_json_string"
-
-    # Update instructions for processor agents to use these new output_keys
-    image_final_result_processor.instruction = image_final_result_processor.instruction.replace(
-        '{image_generation_lr_tool_caller_agent_output_key}', image_generation_lr_tool_caller_agent.output_key
-    )
-    video_final_result_processor.instruction = video_final_result_processor.instruction.replace(
-        '{video_generation_lr_tool_caller_agent_output_key}', video_generation_lr_tool_caller_agent.output_key
-    )
-    tts_final_result_processor.instruction = tts_final_result_processor.instruction.replace(
-        '{tts_lr_tool_caller_agent_output_key}', tts_lr_tool_caller_agent.output_key
-    )
-    stt_final_result_processor.instruction = stt_final_result_processor.instruction.replace(
-        '{stt_lr_tool_caller_agent_output_key}', stt_lr_tool_caller_agent.output_key
-    )
 
     # --- Update ParallelAssetPipelinesAgent ---
     parallel_asset_pipelines_instance = ParallelAgent(
         name="ParallelAssetGenerationPipelines",
         sub_agents=[
-            static_asset_pipeline_agent_instance,         # Unchanged in its LR nature (uses LlmAgents for tools)
+            #static_asset_pipeline_agent_instance,         # Unchanged in its LR nature (uses LlmAgents for tools)
             image_generation_initiation_sequence,         # NEW: Initiates LR image gen
             video_generation_initiation_sequence,         # NEW: Initiates LR video gen
             tts_lr_tool_caller_agent,      
@@ -2084,23 +1840,6 @@ Output: 'STT result processed, timestamps stored.' or 'STT processing failed.'""
         description="Orchestrates game recap and ADK-native long-running asset creation with client-side polling."
     )
 
-
-
-
-    # 5. The New GameRecapAgentV2 (Sequential Orchestrator)
-    #    This is the agent that will be routed to by the root_agent.
-    #    Its _run_async_impl is implicitly handled by SequentialAgent.
-    #    We must provide a final output if this agent is called directly by the root agent (final response).
-    #    To do this, we can add a final LlmAgent that just takes 'current_recap' and outputs it.
-
-
-
-
-
-    # Inside game_recap_assistant_v2, a dummy _run_async_impl is needed if it inherits BaseAgent directly.
-    # However, SequentialAgent, ParallelAgent, LoopAgent are workflow agents; they don't need _run_async_impl.
-    # If game_recap_assistant_v2 itself needs to yield the final recap, it can't be just a SequentialAgent.
-    # The SequentialAgent will yield events from its sub-agents. The final event from `final_recap_output_agent` will be the recap.
 
     # --- Root Agent ---
     root_agent = LlmAgent(

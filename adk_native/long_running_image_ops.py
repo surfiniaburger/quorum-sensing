@@ -40,6 +40,9 @@ IMAGE_GENERATION_ERROR_SLEEP_SECONDS = int(os.getenv("IMAGE_GENERATION_ERROR_SLE
 IMAGE_GENERATION_QUOTA_SLEEP_SECONDS = int(os.getenv("IMAGE_GENERATION_QUOTA_SLEEP_SECONDS_NATIVE", 65))
 CLOUDFLARE_FALLBACK_SLEEP_SECONDS = int(os.getenv("CLOUDFLARE_FALLBACK_SLEEP_SECONDS_NATIVE", 2))
 
+MAX_API_RETRIES = 3  # Max retries for API calls (like Imagen) per prompt
+BASE_RETRY_SLEEP_SECONDS = 2  
+
 logger = logging.getLogger(__name__)
 
 IMAGE_GENERATION_TASKS: Dict[str, Dict[str, Any]] = {}
@@ -132,7 +135,7 @@ async def _perform_image_generation_work(task_id: str, prompts: List[str], game_
     ensure_clients_initialized()
     IMAGE_GENERATION_TASKS[task_id]["status"] = "processing"
     generated_uris: List[str] = []
-    errors: List[str] = []
+    errors: List[str] = [] # Collect errors for each prompt
     timestamp = datetime.now(UTC).strftime("%Y%m%d%H%M%S")
 
     generation_params = {
@@ -147,109 +150,164 @@ async def _perform_image_generation_work(task_id: str, prompts: List[str], game_
         image_bytes = None
         model_used = None
         content_type = 'image/png'
-        imagen_succeeded = False
+        imagen_succeeded_this_prompt = False
 
         if imagen_model_instance:
-            try:
-                current_seed = IMAGE_GENERATION_SEED
-                if current_seed is None and not IMAGE_GENERATION_WATERMARK:
-                    current_seed = random.randint(1, 2**31 - 1)
+            for attempt in range(MAX_API_RETRIES):
+                try:
+                    current_seed = IMAGE_GENERATION_SEED
+                    if current_seed is None and not IMAGE_GENERATION_WATERMARK:
+                        current_seed = random.randint(1, 2**31 - 1)
 
-                response = await asyncio.to_thread(
-                    imagen_model_instance.generate_images,
-                    prompt=prompt_text,
-                    seed=current_seed,
-                    number_of_images=generation_params["number_of_images"],
-                    aspect_ratio=generation_params["aspect_ratio"],
-                    add_watermark=generation_params["add_watermark"],
-                    negative_prompt=generation_params["negative_prompt"]
-                )
-                if response and response.images:
-                    img_object = response.images[0]
-                    if hasattr(img_object, '_image_bytes') and img_object._image_bytes:
-                        image_bytes = img_object._image_bytes
-                        content_type = getattr(img_object, 'mime_type', 'image/png')
+                    logger.info(f"[Task {task_id}] Prompt {i+1}, Attempt {attempt+1}/{MAX_API_RETRIES} for Imagen.")
+                    response = await asyncio.to_thread(
+                        imagen_model_instance.generate_images,
+                        prompt=prompt_text,
+                        seed=current_seed,
+                        number_of_images=generation_params["number_of_images"],
+                        aspect_ratio=generation_params["aspect_ratio"],
+                        add_watermark=generation_params["add_watermark"],
+                        negative_prompt=generation_params["negative_prompt"]
+                    )
+
+                    if response and response.images:
+                        img_object = response.images[0]
+                        if hasattr(img_object, '_image_bytes') and img_object._image_bytes:
+                            image_bytes = img_object._image_bytes
+                            content_type = getattr(img_object, 'mime_type', 'image/png')
+                        else: # Fallback for PIL-only response
+                            pil_img = img_object._pil_image
+                            buffer = io.BytesIO()
+                            pil_img.save(buffer, format="PNG")
+                            image_bytes = buffer.getvalue()
+                            content_type = 'image/png'
+                        
                         model_used = VERTEX_IMAGEN_MODEL_ID
-                        imagen_succeeded = True
+                        imagen_succeeded_this_prompt = True
+                        logger.info(f"[Task {task_id}] Imagen generation successful for prompt {i+1} on attempt {attempt+1}.")
+                        break # Success, break from retry loop for this prompt
+
                     else:
-                        pil_img = img_object._pil_image
-                        buffer = io.BytesIO()
-                        pil_img.save(buffer, format="PNG")
-                        image_bytes = buffer.getvalue()
-                        content_type = 'image/png'
-                        model_used = VERTEX_IMAGEN_MODEL_ID
-                        imagen_succeeded = True
-                if imagen_succeeded:
-                    logger.info(f"[Task {task_id}] Imagen generation successful for prompt {i+1}.")
-                    await asyncio.sleep(IMAGE_GENERATION_SLEEP_SECONDS)
-                else:
-                    logger.warning(f"[Task {task_id}] Imagen returned no image for prompt {i+1}.")
-            except google_exceptions.ResourceExhausted as quota_error:
-                err_msg = f"Imagen Quota Exceeded for prompt {i+1}: {quota_error}"
-                logger.error(f"[Task {task_id}] {err_msg}")
-                errors.append(err_msg)
-                await asyncio.sleep(IMAGE_GENERATION_QUOTA_SLEEP_SECONDS)
-                continue
-            except Exception as e:
-                logger.error(f"[Task {task_id}] Unexpected Imagen Error for prompt {i+1}: {e}", exc_info=True)
-                await asyncio.sleep(IMAGE_GENERATION_ERROR_SLEEP_SECONDS)
+                        logger.warning(f"[Task {task_id}] Imagen returned no image for prompt {i+1} on attempt {attempt+1}.")
+                        # This isn't necessarily a retryable API error, might be prompt issue.
+                        # For now, let's treat it as a failure for this attempt; if all attempts fail, it's an error for the prompt.
+                        if attempt == MAX_API_RETRIES - 1:
+                             errors.append(f"Imagen returned no image for prompt: {prompt_text[:50]}...")
 
-        if not imagen_succeeded:
+
+                except google_exceptions.ResourceExhausted as quota_error:
+                    err_msg = f"Imagen Quota Exceeded for prompt {i+1} (attempt {attempt+1}): {quota_error}"
+                    logger.error(f"[Task {task_id}] {err_msg}")
+                    if attempt < MAX_API_RETRIES - 1:
+                        # Exponential backoff with jitter
+                        sleep_time = (BASE_RETRY_SLEEP_SECONDS ** attempt) + random.uniform(0.5, 1.5)
+                        logger.warning(f"[Task {task_id}] Retrying prompt {i+1} in {sleep_time:.2f}s due to quota error.")
+                        await asyncio.sleep(sleep_time)
+                    else:
+                        logger.error(f"[Task {task_id}] Quota error for prompt {i+1} after {MAX_API_RETRIES} attempts. Adding to errors and sleeping longer before next prompt (if any).")
+                        errors.append(f"Quota exceeded for prompt: {prompt_text[:50]}... after retries.")
+                        await asyncio.sleep(IMAGE_GENERATION_QUOTA_SLEEP_SECONDS) # Longer sleep after repeated quota failure for one prompt
+                        break # Break from attempt loop, move to next prompt
+                
+                except google_exceptions.GoogleAPICallError as api_call_error: # Catch other Google API errors
+                    err_msg = f"Imagen API Call Error for prompt {i+1} (attempt {attempt+1}): {api_call_error}"
+                    logger.error(f"[Task {task_id}] {err_msg}")
+                    if attempt < MAX_API_RETRIES - 1:
+                        sleep_time = (BASE_RETRY_SLEEP_SECONDS ** attempt) + random.uniform(0.5, 1.5)
+                        logger.warning(f"[Task {task_id}] Retrying prompt {i+1} in {sleep_time:.2f}s due to API call error.")
+                        await asyncio.sleep(sleep_time)
+                    else:
+                        logger.error(f"[Task {task_id}] API Call error for prompt {i+1} after {MAX_API_RETRIES} attempts.")
+                        errors.append(f"API call error for prompt: {prompt_text[:50]}... ({api_call_error})")
+                        await asyncio.sleep(IMAGE_GENERATION_ERROR_SLEEP_SECONDS)
+                        break # Break from attempt loop
+
+                except Exception as e: # Catch other unexpected errors during Imagen call
+                    err_msg = f"Unexpected Imagen Error for prompt {i+1} (attempt {attempt+1}): {e}"
+                    logger.error(f"[Task {task_id}] {err_msg}", exc_info=True) # exc_info for full traceback
+                    if attempt < MAX_API_RETRIES - 1:
+                        sleep_time = (BASE_RETRY_SLEEP_SECONDS ** attempt) + random.uniform(0.5, 1.5)
+                        logger.warning(f"[Task {task_id}] Retrying prompt {i+1} in {sleep_time:.2f}s due to unexpected error.")
+                        await asyncio.sleep(sleep_time)
+                    else:
+                        logger.error(f"[Task {task_id}] Unexpected error for prompt {i+1} after {MAX_API_RETRIES} attempts.")
+                        errors.append(f"Unexpected error for prompt: {prompt_text[:50]}... ({e})")
+                        await asyncio.sleep(IMAGE_GENERATION_ERROR_SLEEP_SECONDS)
+                        break # Break from attempt loop
+            # End of retry loop for a single prompt with Imagen
+        else: # Imagen model instance not available
+            logger.warning(f"[Task {task_id}] Imagen model not available for prompt {i+1}.")
+            # errors.append("Imagen model not available.") # Not an error for this prompt if fallback exists
+
+        # --- Cloudflare Fallback ---
+        if not imagen_succeeded_this_prompt:
             if cloudflare_account_id_global and cloudflare_api_token_global:
-                logger.info(f"[Task {task_id}] Attempting Cloudflare fallback for prompt {i+1}.")
+                logger.info(f"[Task {task_id}] Attempting Cloudflare fallback for prompt {i+1} as Imagen failed or was unavailable.")
+                # No complex retry for Cloudflare in this example, but could be added
                 cf_image_bytes = await _generate_image_cloudflare_native(prompt_text)
                 if cf_image_bytes:
                     image_bytes = cf_image_bytes
                     model_used = CLOUDFLARE_FALLBACK_MODEL
-                    content_type = 'image/png'
+                    content_type = 'image/png' # Assume PNG for Cloudflare
                     logger.info(f"[Task {task_id}] Cloudflare fallback successful for prompt {i+1}.")
                 else:
-                    err_msg = f"Cloudflare fallback also failed for prompt {i+1}."
-                    logger.warning(f"[Task {task_id}] {err_msg}")
-                    errors.append(err_msg)
-                await asyncio.sleep(CLOUDFLARE_FALLBACK_SLEEP_SECONDS)
-            elif imagen_model_instance:
-                err_msg = f"Imagen failed for prompt {i+1} and Cloudflare fallback is disabled."
-                logger.warning(f"[Task {task_id}] {err_msg}")
-                errors.append(err_msg)
+                    err_msg_cf = f"Cloudflare fallback also failed for prompt: {prompt_text[:50]}..."
+                    logger.warning(f"[Task {task_id}] {err_msg_cf}")
+                    errors.append(err_msg_cf) # Add Cloudflare failure to errors
+                await asyncio.sleep(CLOUDFLARE_FALLBACK_SLEEP_SECONDS) # Pause after Cloudflare attempt
+            elif imagen_model_instance: # Log only if Imagen was tried and failed, and CF is unavailable
+                logger.warning(f"[Task {task_id}] Imagen failed for prompt {i+1} and Cloudflare fallback is disabled/unavailable.")
+                # The error from Imagen attempts should already be in 'errors' list
+            else: # Both Imagen and Cloudflare are unavailable
+                err_msg_no_model = f"No image generation model (Imagen or Cloudflare) available for prompt: {prompt_text[:50]}..."
+                logger.error(f"[Task {task_id}] {err_msg_no_model}")
+                errors.append(err_msg_no_model)
 
+
+        # --- Save Result if image_bytes were obtained ---
         if image_bytes and model_used:
             try:
                 prompt_slug = re.sub(r'\W+', '_', prompt_text[:30]).strip('_')
                 file_ext = "png" if content_type == 'image/png' else "jpg"
                 final_content_type = content_type if content_type.startswith('image/') else 'image/jpeg'
                 blob_name = f"adk_native/game_{game_pk_str}/img_{timestamp}_{i+1:02d}_{prompt_slug}.{file_ext}"
+                
                 gcs_uri = await _save_image_to_gcs_native(image_bytes, GCS_BUCKET_GENERATED_ASSETS, blob_name, final_content_type)
                 if gcs_uri:
                     generated_uris.append(gcs_uri)
-                else:
-                    err_msg = f"Failed to save image from {model_used} to GCS for prompt {i+1} (GCS URI was None)."
-                    logger.warning(f"[Task {task_id}] {err_msg}")
-                    errors.append(err_msg)
-            except Exception as save_err:
-                err_msg = f"Exception during GCS save for image from {model_used} for prompt {i+1}: {save_err}"
-                logger.error(f"[Task {task_id}] {err_msg}", exc_info=True)
-                errors.append(err_msg)
+                else: # _save_image_to_gcs_native already logs its error
+                    err_msg_save = f"Failed to save image from {model_used} to GCS for prompt {i+1} (GCS URI was None after save attempt)."
+                    logger.warning(f"[Task {task_id}] {err_msg_save}")
+                    errors.append(err_msg_save)
+            except Exception as save_err: # Catch any other error during GCS save prep or call
+                err_msg_save_exc = f"Exception during GCS save for image from {model_used} (prompt {i+1}): {save_err}"
+                logger.error(f"[Task {task_id}] {err_msg_save_exc}", exc_info=True)
+                errors.append(err_msg_save_exc)
+        
+        # General pause between processing different prompts if previous prompt processing didn't already sleep due to quota/error
+        if i < len(prompts) - 1 and not (imagen_model_instance and not imagen_succeeded_this_prompt): # Avoid double sleep if fallback was used
+            logger.debug(f"[Task {task_id}] General pause of {IMAGE_GENERATION_SLEEP_SECONDS}s before next prompt.")
+            await asyncio.sleep(IMAGE_GENERATION_SLEEP_SECONDS)
 
+    # --- Final Task Status Update ---
     if not generated_uris and errors:
         IMAGE_GENERATION_TASKS[task_id].update({
             "status": "failed",
-            "error": "; ".join(errors) if errors else "Image generation failed with no specific GCS URIs and no specific errors captured."
+            "error": "; ".join(errors) if errors else "Image generation task failed with no specific errors but no URIs."
         })
     elif errors: # Some URIs might have been generated, but some errors also occurred
         IMAGE_GENERATION_TASKS[task_id].update({
             "status": "completed_with_errors",
-            "result": json.dumps(generated_uris),
+            "result": json.dumps(generated_uris), # Still provide successful URIs
             "errors": errors
         })
     else: # All successful
         IMAGE_GENERATION_TASKS[task_id].update({
             "status": "completed",
             "result": json.dumps(generated_uris),
-            "errors": []
+            "errors": [] # No errors
         })
-    logger.info(f"[Task {task_id}] Image generation work finished. Status: {IMAGE_GENERATION_TASKS[task_id]['status']}")
-
+    logger.info(f"[Task {task_id}] Image generation work finished. Overall Status: {IMAGE_GENERATION_TASKS[task_id]['status']}. Generated URIs: {len(generated_uris)}. Errors: {len(errors)}")
 def initiate_image_generation(prompts: List[str], game_pk_str: str = "unknown_game", tool_context: Optional[ToolContext] = None) -> Dict[str, Any]:
     ensure_clients_initialized()
     if not isinstance(prompts, list) or not all(isinstance(p, str) for p in prompts):
